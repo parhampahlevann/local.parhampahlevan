@@ -7,7 +7,8 @@ PORT=8080
 ALTERNATE_PORT=8081
 CONFIG_FILE="/etc/iranv6tun.conf"
 LOG_FILE="/var/log/iranv6tun.log"
-MTU_SIZE=1420  # Changed to 1420 as requested
+MTU_SIZE=1420
+BACKUP_FILE="/etc/iranv6tun_backup.conf"
 
 # Colors
 RED='\033[0;31m'
@@ -34,7 +35,7 @@ show_menu() {
     echo "║    Iran-Foreign IPv6 Tunnel        ║"
     echo "╠════════════════════════════════════╣"
     echo "║ 1. Create Tunnel                  ║"
-    echo "║ 2. Remove Tunnel                  ║"
+    echo "║ 2. Remove Tunnel (Complete Uninstall) ║"
     echo "║ 3. Check Connection               ║"
     echo "║ 4. Show Tunnel Info               ║"
     echo "║ 5. Install Dependencies           ║"
@@ -44,11 +45,79 @@ show_menu() {
     echo -e "${NC}"
 }
 
-# Cleanup function
-cleanup() {
-    echo -e "${BLUE}Cleaning up existing tunnel...${NC}" >&3
+# Backup current network config
+backup_config() {
+    echo -e "${BLUE}Backing up current network configuration...${NC}" >&3
+    {
+        echo "# Backup created at $(date)"
+        echo "IPTABLES_BACKUP=$(iptables-save 2>/dev/null | base64 -w0)"
+        echo "IP6TABLES_BACKUP=$(ip6tables-save 2>/dev/null | base64 -w0)"
+        echo "SYSCTL_BACKUP=$(sysctl -a 2>/dev/null | grep 'net.ipv6.conf' | base64 -w0)"
+        echo "INTERFACES_BACKUP=$(ip -6 addr show 2>/dev/null | base64 -w0)"
+    } > "$BACKUP_FILE"
+    echo -e "${GREEN}Backup saved to $BACKUP_FILE${NC}" >&3
+}
+
+# Restore network config
+restore_config() {
+    if [ ! -f "$BACKUP_FILE" ]; then
+        echo -e "${YELLOW}No backup file found. Performing basic cleanup.${NC}" >&3
+        basic_cleanup
+        return
+    fi
+
+    echo -e "${BLUE}Restoring original network configuration...${NC}" >&3
+    
+    # Basic cleanup first
+    basic_cleanup
+    
+    # Restore from backup
+    source "$BACKUP_FILE"
+    
+    # Restore iptables
+    if [ -n "$IPTABLES_BACKUP" ]; then
+        echo "$IPTABLES_BACKUP" | base64 -d | iptables-restore
+    fi
+    
+    # Restore ip6tables
+    if [ -n "$IP6TABLES_BACKUP" ]; then
+        echo "$IP6TABLES_BACKUP" | base64 -d | ip6tables-restore
+    fi
+    
+    # Restore sysctl
+    if [ -n "$SYSCTL_BACKUP" ]; then
+        echo "$SYSCTL_BACKUP" | base64 -d | while read -r line; do
+            sysctl -w "$line" >/dev/null
+        done
+    fi
+    
+    echo -e "${GREEN}Original network configuration restored successfully!${NC}" >&3
+    rm -f "$BACKUP_FILE"
+}
+
+# Basic cleanup function
+basic_cleanup() {
+    echo -e "${BLUE}Performing basic cleanup...${NC}" >&3
+    
+    # Kill socat processes
     pkill -f "socat TCP.*$TUNNEL_IFACE" 2>/dev/null
+    
+    # Remove tunnel interface
     ip link delete $TUNNEL_IFACE 2>/dev/null
+    
+    # Remove IPv6 address and route
+    ip -6 addr flush dev $TUNNEL_IFACE 2>/dev/null
+    ip -6 route flush dev $TUNNEL_IFACE 2>/dev/null
+    
+    # Remove tunnel config file
+    rm -f "$CONFIG_FILE"
+    
+    # Reset firewall rules
+    ip6tables -D INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
+    ip6tables -D INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
+    ip6tables -D FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
+    ip6tables -D FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
+    
     sleep 2
 }
 
@@ -97,6 +166,9 @@ create_tunnel_iproute() {
 # Configure tunnel with enhanced connectivity settings
 configure_tunnel() {
     echo -e "${BLUE}Configuring tunnel interface...${NC}" >&3
+    
+    # Backup current config before making changes
+    backup_config
     
     # Set MTU to 1420 as requested
     ip link set $TUNNEL_IFACE mtu $MTU_SIZE
@@ -166,7 +238,7 @@ create_tunnel() {
     done
 
     # Cleanup existing tunnel
-    cleanup
+    basic_cleanup
     
     # Create tunnel using iproute
     create_tunnel_iproute
@@ -226,7 +298,90 @@ create_tunnel() {
     read -p "Press [Enter] to return to main menu" <&3
 }
 
-# ... [Other functions remain unchanged: remove_tunnel, check_connection, show_info, view_logs] ...
+# Remove tunnel (Complete Uninstall)
+remove_tunnel() {
+    echo -e "${RED}WARNING: This will completely remove the tunnel and restore original network settings${NC}" >&3
+    read -p "Are you sure you want to continue? [y/N] " confirm
+    
+    if [[ $confirm =~ ^[Yy]$ ]]; then
+        restore_config
+        echo -e "${GREEN}All tunnel configurations have been completely removed and original settings restored.${NC}" >&3
+    else
+        echo -e "${YELLOW}Uninstall canceled.${NC}" >&3
+    fi
+    
+    read -p "Press [Enter] to return to main menu" <&3
+}
+
+# Check connection
+check_connection() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}No active tunnel configuration found.${NC}" >&3
+        read -p "Press [Enter] to return to main menu" <&3
+        return
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    if [ "$LOCATION" == "Iran" ]; then
+        ping_target="${TUNNEL_PREFIX}::2"
+    else
+        ping_target="${TUNNEL_PREFIX}::1"
+    fi
+    
+    echo -e "${BLUE}Testing connection to remote server...${NC}" >&3
+    if ping6 -c 4 -M do -s $((MTU_SIZE-48)) "$ping_target"; then
+        echo -e "${GREEN}Connection successful with MTU $MTU_SIZE!${NC}" >&3
+    else
+        echo -e "${YELLOW}Trying with default packet size...${NC}" >&3
+        if ping6 -c 4 "$ping_target"; then
+            echo -e "${YELLOW}Connection works but MTU size may need adjustment${NC}" >&3
+        else
+            echo -e "${RED}Connection failed completely${NC}" >&3
+        fi
+    fi
+    
+    read -p "Press [Enter] to return to main menu" <&3
+}
+
+# Show tunnel info
+show_info() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}No active tunnel configuration found.${NC}" >&3
+    else
+        source "$CONFIG_FILE"
+        
+        echo -e "${BLUE}Current Tunnel Configuration:${NC}" >&3
+        echo -e "${YELLOW}Location: $LOCATION" >&3
+        echo "Iran IPv4: $IRAN_IPV4" >&3
+        echo "Foreign IPv4: $FOREIGN_IPV4" >&3
+        echo "Local IPv6: $LOCAL_IPV6" >&3
+        echo "Remote IPv6: $REMOTE_IPV6" >&3
+        echo "MTU Size: $MTU_SIZE${NC}" >&3
+        
+        echo -e "\n${BLUE}Interface Status:${NC}" >&3
+        ip link show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}Interface not found${NC}" >&3
+        
+        echo -e "\n${BLUE}IPv6 Address:${NC}" >&3
+        ip -6 addr show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 address${NC}" >&3
+        
+        echo -e "\n${BLUE}IPv6 Route:${NC}" >&3
+        ip -6 route show dev $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 routes${NC}" >&3
+    fi
+    
+    read -p "Press [Enter] to return to main menu" <&3
+}
+
+# View logs
+view_logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo -e "${RED}No log file found.${NC}" >&3
+    else
+        echo -e "${BLUE}Last 50 lines of log:${NC}" >&3
+        tail -n 50 "$LOG_FILE" >&3
+    fi
+    read -p "Press [Enter] to return to main menu" <&3
+}
 
 # Main loop
 while true; do
