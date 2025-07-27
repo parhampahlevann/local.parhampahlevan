@@ -7,6 +7,7 @@ PORT=8080
 ALTERNATE_PORT=8081
 CONFIG_FILE="/etc/iranv6tun.conf"
 LOG_FILE="/var/log/iranv6tun.log"
+MTU_SIZE=1420  # Changed to 1420 as requested
 
 # Colors
 RED='\033[0;31m'
@@ -85,35 +86,23 @@ install_deps() {
     read -p "Press [Enter] to return to main menu" <&3
 }
 
-# Create tunnel methods
-create_tunnel_socat_gre() {
-    echo -e "${BLUE}Creating tunnel using socat with GRE...${NC}" >&3
-    nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
-    sleep 3
-}
-
+# Create tunnel using iproute2 (SIT)
 create_tunnel_iproute() {
     echo -e "${BLUE}Creating tunnel using iproute2 (SIT)...${NC}" >&3
     ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
-    ip link set $TUNNEL_IFACE up
+    ip link set $TUNNEL_IFACE up mtu $MTU_SIZE
     sleep 2
 }
 
-create_tunnel_socat_raw() {
-    echo -e "${BLUE}Creating tunnel using socat with raw IP...${NC}" >&3
-    nohup socat TCP-LISTEN:$ALTERNATE_PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=ip,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
-    sleep 3
-}
-
-# Configure tunnel with fixes for connectivity issues
+# Configure tunnel with enhanced connectivity settings
 configure_tunnel() {
     echo -e "${BLUE}Configuring tunnel interface...${NC}" >&3
     
-    # Set MTU
-    ip link set $TUNNEL_IFACE mtu 1400
+    # Set MTU to 1420 as requested
+    ip link set $TUNNEL_IFACE mtu $MTU_SIZE
     
-    # Add IPv6 address with proper subnet
-    ip addr add $LOCAL_IPV6 dev $TUNNEL_IFACE
+    # Add IPv6 address
+    ip addr add $LOCAL_IPV6/64 dev $TUNNEL_IFACE
     
     # Add IPv6 route
     ip route add ::/0 dev $TUNNEL_IFACE metric 100
@@ -132,6 +121,7 @@ configure_tunnel() {
     ip6tables -P FORWARD ACCEPT 2>/dev/null
     ip6tables -F 2>/dev/null
     ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null
     ip6tables -A FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -A FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     
@@ -140,16 +130,15 @@ configure_tunnel() {
         echo "LOCATION=$location"
         echo "IRAN_IPV4=$IRAN_IPV4"
         echo "FOREIGN_IPV4=$FOREIGN_IPV4"
-        echo "PORT=$PORT"
-        echo "ALTERNATE_PORT=$ALTERNATE_PORT"
         echo "LOCAL_IPV6=$LOCAL_IPV6"
         echo "REMOTE_IPV6=$REMOTE_IPV6"
+        echo "MTU_SIZE=$MTU_SIZE"
     } > $CONFIG_FILE
     
     echo -e "${GREEN}Tunnel configuration saved successfully!${NC}" >&3
 }
 
-# Create tunnel with improved connectivity
+# Create tunnel with enhanced connectivity
 create_tunnel() {
     # Get server information
     echo -e "${YELLOW}Enter server information:${NC}" >&3
@@ -179,69 +168,65 @@ create_tunnel() {
     # Cleanup existing tunnel
     cleanup
     
-    # Try methods in order
-    echo -e "${BLUE}Attempting to create tunnel...${NC}" >&3
-    
-    # Use iproute method as primary
+    # Create tunnel using iproute
     create_tunnel_iproute
     
     if ! verify_interface; then
-        echo -e "${YELLOW}Primary method failed, trying fallback methods...${NC}" >&3
-        create_tunnel_socat_gre || create_tunnel_socat_raw
-        
-        if ! verify_interface; then
-            echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE' after multiple attempts${NC}" >&3
-            echo -e "${YELLOW}Troubleshooting steps:" >&3
-            echo "1. Check kernel modules: 'lsmod | grep -E \"gre|sit\"'" >&3
-            echo "2. Verify socat installation: 'socat -h'" >&3
-            echo "3. Check port availability: 'netstat -tulnp | grep -E \"$PORT|$ALTERNATE_PORT\"'" >&3
-            read -p "Press [Enter] to return to main menu" <&3
-            return 1
-        fi
+        echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE'${NC}" >&3
+        echo -e "${YELLOW}Troubleshooting steps:" >&3
+        echo "1. Check kernel modules: 'lsmod | grep sit'" >&3
+        echo "2. Check system logs: 'dmesg | tail -20'" >&3
+        read -p "Press [Enter] to return to main menu" <&3
+        return 1
     fi
 
-    # Configure the tunnel with fixes
+    # Configure the tunnel with enhanced settings
     configure_tunnel
     
     echo -e "${GREEN}Tunnel created successfully!${NC}" >&3
     echo -e "${YELLOW}Local IPv6: $LOCAL_IPV6${NC}" >&3
     echo -e "${YELLOW}Remote IPv6: $REMOTE_IPV6${NC}" >&3
     
-    # Display connection instructions
+    # Display connection instructions for the other server
     if [ "$location" == "Foreign" ]; then
         echo -e "${BLUE}On the Iran server, run these commands:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $FOREIGN_IPV4 local $IRAN_IPV4 ttl 255" >&3
-        echo "ip link set $TUNNEL_IFACE up mtu 1400" >&3
+        echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip addr add ${TUNNEL_PREFIX}::1/64 dev $TUNNEL_IFACE" >&3
         echo "ip route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
     else
         echo -e "${BLUE}On the Foreign server, run these commands:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $IRAN_IPV4 local $FOREIGN_IPV4 ttl 255" >&3
-        echo "ip link set $TUNNEL_IFACE up mtu 1400" >&3
+        echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip addr add ${TUNNEL_PREFIX}::2/64 dev $TUNNEL_IFACE" >&3
         echo "ip route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
     fi
     
-    # Test connection immediately
-    echo -e "${BLUE}Testing connection...${NC}" >&3
-    if ping6 -c 4 $REMOTE_IPV6; then
-        echo -e "${GREEN}Connection test successful!${NC}" >&3
+    # Advanced connectivity test
+    echo -e "${BLUE}Performing advanced connectivity test...${NC}" >&3
+    echo -e "${YELLOW}Testing ping6 to remote server...${NC}" >&3
+    
+    if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6; then
+        echo -e "${GREEN}Connectivity test successful with MTU $MTU_SIZE!${NC}" >&3
     else
-        echo -e "${YELLOW}Connection test failed. Trying additional fixes...${NC}" >&3
+        echo -e "${YELLOW}Standard ping failed, trying smaller packet size...${NC}" >&3
         
-        # Additional troubleshooting steps
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -F
-        ip link set $TUNNEL_IFACE mtu 1280
-        
-        echo -e "${YELLOW}Please try pinging again from the other server.${NC}" >&3
+        if ping6 -c 4 $REMOTE_IPV6; then
+            echo -e "${YELLOW}Connection works with default packet size but not with MTU $MTU_SIZE${NC}" >&3
+            echo -e "${YELLOW}Try adjusting the MTU size on both servers.${NC}" >&3
+        else
+            echo -e "${RED}Connection failed completely. Troubleshooting needed.${NC}" >&3
+            echo -e "${YELLOW}Please check:" >&3
+            echo "1. Firewall rules on both servers" >&3
+            echo "2. Physical network connectivity" >&3
+            echo "3. Correct IP addresses configuration" >&3
+        fi
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
 }
 
-# ... [بقیه توابع بدون تغییر شامل remove_tunnel, check_connection, show_info, view_logs] ...
+# ... [Other functions remain unchanged: remove_tunnel, check_connection, show_info, view_logs] ...
 
 # Main loop
 while true; do
