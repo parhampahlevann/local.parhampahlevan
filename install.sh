@@ -4,6 +4,7 @@
 TUNNEL_IFACE="iranv6tun"
 TUNNEL_PREFIX="fdbd:1b5d:0aa8"
 PORT=8080
+TIMEOUT=10
 
 # Colors
 RED='\033[0;31m'
@@ -20,9 +21,24 @@ fi
 
 # Cleanup existing tunnel
 cleanup() {
+    echo -e "${BLUE}Cleaning up existing tunnel...${NC}"
     pkill -f "socat TCP.*$TUNNEL_IFACE" 2>/dev/null
     ip link delete $TUNNEL_IFACE 2>/dev/null
     rm -f /etc/iranv6tun.conf
+    sleep 2
+}
+
+# Verify tunnel creation
+verify_tunnel() {
+    local attempts=0
+    while [ $attempts -lt 5 ]; do
+        if ip link show $TUNNEL_IFACE >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        ((attempts++))
+    done
+    return 1
 }
 
 # Install dependencies
@@ -68,8 +84,25 @@ create_tunnel() {
     echo -e "${BLUE}Creating TCP-encapsulated GRE tunnel...${NC}"
     nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
     
-    sleep 2
-    
+    # Verify tunnel creation
+    if ! verify_tunnel; then
+        echo -e "${RED}Failed to create tunnel interface. Retrying with different method...${NC}"
+        # Alternative creation method
+        ip tunnel add $TUNNEL_IFACE mode gre remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
+        ip link set $TUNNEL_IFACE up
+    fi
+
+    # Additional verification
+    if ! verify_tunnel; then
+        echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE'${NC}"
+        echo -e "${YELLOW}Troubleshooting steps:"
+        echo "1. Check if 'socat' is properly installed"
+        echo "2. Verify there are no conflicting interfaces"
+        echo "3. Try changing the tunnel interface name"
+        echo "4. Check system logs for errors (journalctl -xe)"
+        exit 1
+    fi
+
     # Configure tunnel
     ip link set $TUNNEL_IFACE up mtu 1400
     ip addr add $LOCAL_IPV6 dev $TUNNEL_IFACE
@@ -109,7 +142,13 @@ check_connection() {
         fi
         
         echo -e "${BLUE}Testing connection to remote server...${NC}"
-        ping6 -c 4 $ping_target
+        if ! ping6 -c 4 $ping_target; then
+            echo -e "${RED}Connection failed. Troubleshooting:${NC}"
+            echo "1. Verify tunnel is up: ip link show $TUNNEL_IFACE"
+            echo "2. Check IP assignment: ip -6 addr show $TUNNEL_IFACE"
+            echo "3. Verify socat is running: ps aux | grep socat"
+            echo "4. Check firewall rules: ip6tables -L -n -v"
+        fi
     else
         echo -e "${RED}No active tunnel configuration found.${NC}"
     fi
