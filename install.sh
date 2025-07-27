@@ -7,7 +7,7 @@ PORT=8080
 ALTERNATE_PORT=8081
 CONFIG_FILE="/etc/iranv6tun.conf"
 LOG_FILE="/var/log/iranv6tun.log"
-MTU_SIZE=1420
+MTU_SIZE=1280  # Optimal MTU for tunnel
 BACKUP_FILE="/etc/iranv6tun_backup.conf"
 
 # Colors
@@ -35,7 +35,7 @@ show_menu() {
     echo "║    Iran-Foreign IPv6 Tunnel        ║"
     echo "╠════════════════════════════════════╣"
     echo "║ 1. Create Tunnel                  ║"
-    echo "║ 2. Remove Tunnel (Complete Uninstall) ║"
+    echo "║ 2. Remove Tunnel (Complete)       ║"
     echo "║ 3. Check Connection               ║"
     echo "║ 4. Show Tunnel Info               ║"
     echo "║ 5. Install Dependencies           ║"
@@ -68,23 +68,18 @@ restore_config() {
 
     echo -e "${BLUE}Restoring original network configuration...${NC}" >&3
     
-    # Basic cleanup first
     basic_cleanup
     
-    # Restore from backup
     source "$BACKUP_FILE"
     
-    # Restore iptables
     if [ -n "$IPTABLES_BACKUP" ]; then
         echo "$IPTABLES_BACKUP" | base64 -d | iptables-restore
     fi
     
-    # Restore ip6tables
     if [ -n "$IP6TABLES_BACKUP" ]; then
         echo "$IP6TABLES_BACKUP" | base64 -d | ip6tables-restore
     fi
     
-    # Restore sysctl
     if [ -n "$SYSCTL_BACKUP" ]; then
         echo "$SYSCTL_BACKUP" | base64 -d | while read -r line; do
             sysctl -w "$line" >/dev/null
@@ -99,29 +94,16 @@ restore_config() {
 basic_cleanup() {
     echo -e "${BLUE}Performing basic cleanup...${NC}" >&3
     
-    # Kill socat processes
     pkill -f "socat TCP.*$TUNNEL_IFACE" 2>/dev/null
-    
-    # Remove tunnel interface
     ip link delete $TUNNEL_IFACE 2>/dev/null
-    
-    # Remove IPv6 address and route
     ip -6 addr flush dev $TUNNEL_IFACE 2>/dev/null
     ip -6 route flush dev $TUNNEL_IFACE 2>/dev/null
-    
-    # Remove tunnel config file
     rm -f "$CONFIG_FILE"
     
-    # Reset firewall rules
     ip6tables -D INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
     ip6tables -D INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
-    ip6tables -D INPUT -p ipv6-icmp --icmpv6-type echo-request -j ACCEPT 2>/dev/null
-    ip6tables -D INPUT -p ipv6-icmp --icmpv6-type echo-reply -j ACCEPT 2>/dev/null
-    ip6tables -D INPUT -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p 41 -j ACCEPT 2>/dev/null
-    iptables -D OUTPUT -p 41 -j ACCEPT 2>/dev/null
     
     sleep 2
 }
@@ -150,15 +132,9 @@ install_deps() {
         yum install -y iproute net-tools socat kmod
     fi
     
-    # Load required kernel modules
-    echo -e "${BLUE}Loading kernel modules...${NC}" >&3
     modprobe ip_gre 2>/dev/null
     modprobe ip6_gre 2>/dev/null
     modprobe sit 2>/dev/null
-    
-    # Enable IPv6
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
     
     echo -e "${GREEN}Dependencies installed successfully!${NC}" >&3
     read -p "Press [Enter] to return to main menu" <&3
@@ -167,22 +143,6 @@ install_deps() {
 # Create tunnel using iproute2 (SIT)
 create_tunnel_iproute() {
     echo -e "${BLUE}Creating tunnel using iproute2 (SIT)...${NC}" >&3
-    
-    # Check if SIT module is loaded
-    if ! lsmod | grep -q "sit"; then
-        modprobe sit
-        if ! lsmod | grep -q "sit"; then
-            echo -e "${RED}Failed to load SIT module. Check kernel support.${NC}" >&3
-            exit 1
-        fi
-    fi
-    
-    # Check IPv4 connectivity
-    if ! ping -c 2 $REMOTE_IPV4 >/dev/null 2>&1; then
-        echo -e "${RED}Cannot ping remote server ($REMOTE_IPV4). Check network connectivity.${NC}" >&3
-        exit 1
-    fi
-    
     ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
     ip link set $TUNNEL_IFACE up mtu $MTU_SIZE
     sleep 2
@@ -192,40 +152,29 @@ create_tunnel_iproute() {
 configure_tunnel() {
     echo -e "${BLUE}Configuring tunnel interface...${NC}" >&3
     
-    # Backup current config before making changes
     backup_config
     
-    # Set MTU
     ip link set $TUNNEL_IFACE mtu $MTU_SIZE
-    
-    # Add IPv6 address
     ip addr add $LOCAL_IPV6/64 dev $TUNNEL_IFACE
+    ip route add ::/0 dev $TUNNEL_IFACE metric 100
     
-    # Clear existing routes and add new route
-    ip -6 route flush dev $TUNNEL_IFACE 2>/dev/null
-    ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100
-    
-    # Enable IPv6 forwarding
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
     sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
     sysctl -w net.ipv6.conf.$TUNNEL_IFACE.forwarding=1 >/dev/null
     
-    # Configure firewall
-    iptables -A INPUT -p 41 -s $REMOTE_IPV4 -j ACCEPT 2>/dev/null
-    iptables -A OUTPUT -p 41 -d $REMOTE_IPV4 -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
-    
-    # Configure ip6tables
+    # Flush existing rules
     ip6tables -F
     ip6tables -X
-    ip6tables -A INPUT -p ipv6-icmp --icmpv6-type echo-request -j ACCEPT
-    ip6tables -A INPUT -p ipv6-icmp --icmpv6-type echo-reply -j ACCEPT
-    ip6tables -A INPUT -i $TUNNEL_IFACE -j ACCEPT
+    ip6tables -Z
+    
+    # Essential IPv6 firewall rules
+    ip6tables -P INPUT ACCEPT
+    ip6tables -P FORWARD ACCEPT
+    ip6tables -P OUTPUT ACCEPT
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
     ip6tables -A FORWARD -i $TUNNEL_IFACE -j ACCEPT
     ip6tables -A FORWARD -o $TUNNEL_IFACE -j ACCEPT
-    ip6tables -P INPUT DROP
-    ip6tables -P FORWARD DROP
     
     # Save configuration
     {
@@ -242,14 +191,6 @@ configure_tunnel() {
 
 # Create tunnel with enhanced connectivity
 create_tunnel() {
-    # Check if IPv6 is enabled
-    if ! sysctl net.ipv6.conf.all.disable_ipv6 | grep -q "=0"; then
-        echo -e "${RED}IPv6 is disabled. Enabling it...${NC}" >&3
-        sysctl -w net.ipv6.conf.all.disable_ipv6=0
-        sysctl -w net.ipv6.conf.default.disable_ipv6=0
-    fi
-
-    # Get server information
     echo -e "${YELLOW}Enter server information:${NC}" >&3
     read -p "Enter Iran server IPv4: " IRAN_IPV4
     read -p "Enter Foreign server IPv4: " FOREIGN_IPV4
@@ -274,10 +215,8 @@ create_tunnel() {
         esac
     done
 
-    # Cleanup existing tunnel
     basic_cleanup
     
-    # Create tunnel using iproute
     create_tunnel_iproute
     
     if ! verify_interface; then
@@ -289,38 +228,46 @@ create_tunnel() {
         return 1
     fi
 
-    # Configure the tunnel with enhanced settings
     configure_tunnel
     
     echo -e "${GREEN}Tunnel created successfully!${NC}" >&3
     echo -e "${YELLOW}Local IPv6: $LOCAL_IPV6${NC}" >&3
     echo -e "${YELLOW}Remote IPv6: $REMOTE_IPV6${NC}" >&3
     
-    # Display connection instructions for the other server
     if [ "$location" == "Foreign" ]; then
         echo -e "${BLUE}On the Iran server, run these commands:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $FOREIGN_IPV4 local $IRAN_IPV4 ttl 255" >&3
         echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip addr add ${TUNNEL_PREFIX}::1/64 dev $TUNNEL_IFACE" >&3
         echo "ip route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
+        echo "sysctl -w net.ipv6.conf.all.forwarding=1" >&3
+        echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
     else
         echo -e "${BLUE}On the Foreign server, run these commands:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $IRAN_IPV4 local $FOREIGN_IPV4 ttl 255" >&3
         echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip addr add ${TUNNEL_PREFIX}::2/64 dev $TUNNEL_IFACE" >&3
         echo "ip route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
+        echo "sysctl -w net.ipv6.conf.all.forwarding=1" >&3
+        echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
     fi
     
-    # Test remote server availability
-    echo -e "${BLUE}Testing remote server availability...${NC}" >&3
-    if ! ping6 -c 4 $REMOTE_IPV6 >/dev/null 2>&1; then
-        echo -e "${RED}Cannot ping remote IPv6 ($REMOTE_IPV6). Ensure the remote server is configured correctly.${NC}" >&3
-        echo -e "${YELLOW}Check the following on the remote server:${NC}" >&3
-        echo "1. Tunnel interface is up: ip link show $TUNNEL_IFACE" >&3
-        echo "2. IPv6 address is set: ip -6 addr show $TUNNEL_IFACE" >&3
-        echo "3. Firewall allows ICMPv6 and protocol 41" >&3
+    # Advanced connectivity test
+    echo -e "${BLUE}Testing connection with ping6...${NC}" >&3
+    
+    if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6; then
+        echo -e "${GREEN}Connection successful with MTU $MTU_SIZE!${NC}" >&3
     else
-        echo -e "${GREEN}Remote server is reachable via IPv6!${NC}" >&3
+        echo -e "${YELLOW}Trying with default packet size...${NC}" >&3
+        if ping6 -c 4 $REMOTE_IPV6; then
+            echo -e "${YELLOW}Connection works but MTU size may need adjustment${NC}" >&3
+        else
+            echo -e "${RED}Connection failed completely${NC}" >&3
+            echo -e "${YELLOW}Please check:" >&3
+            echo "1. Firewall rules on both servers" >&3
+            echo "2. Physical network connectivity" >&3
+            echo "3. Correct IP addresses configuration" >&3
+        fi
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
@@ -357,26 +304,16 @@ check_connection() {
         ping_target="${TUNNEL_PREFIX}::1"
     fi
     
-    echo -e "${BLUE}Testing connection to remote server ($ping_target)...${NC}" >&3
-    for mtu in 1420 1280 1200; do
-        echo -e "${YELLOW}Testing MTU $mtu...${NC}" >&3
-        if ping6 -c 4 -M do -s $((mtu-48)) "$ping_target"; then
-            echo -e "${GREEN}MTU $mtu works!${NC}" >&3
-            MTU_SIZE=$mtu
-            ip link set $TUNNEL_IFACE mtu $MTU_SIZE
-            sed -i "s/MTU_SIZE=.*/MTU_SIZE=$MTU_SIZE/" $CONFIG_FILE
-            break
+    echo -e "${BLUE}Testing connection to remote server...${NC}" >&3
+    if ping6 -c 4 -M do -s $((MTU_SIZE-48)) "$ping_target"; then
+        echo -e "${GREEN}Connection successful with MTU $MTU_SIZE!${NC}" >&3
+    else
+        echo -e "${YELLOW}Trying with default packet size...${NC}" >&3
+        if ping6 -c 4 "$ping_target"; then
+            echo -e "${YELLOW}Connection works but MTU size may need adjustment${NC}" >&3
         else
-            echo -e "${YELLOW}MTU $mtu failed. Trying lower value...${NC}" >&3
+            echo -e "${RED}Connection failed completely${NC}" >&3
         fi
-    done
-    
-    if [ $mtu -eq 1200 ]; then
-        echo -e "${RED}Connection failed with all tested MTU sizes${NC}" >&3
-        echo -e "${YELLOW}Please check:${NC}" >&3
-        echo "1. Firewall rules on both servers (ip6tables -L -v)" >&3
-        echo "2. Physical network connectivity (ping $REMOTE_IPV4)" >&3
-        echo "3. Correct IP addresses configuration (ip -6 addr show)" >&3
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
@@ -405,9 +342,6 @@ show_info() {
         
         echo -e "\n${BLUE}IPv6 Route:${NC}" >&3
         ip -6 route show dev $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 routes${NC}" >&3
-        
-        echo -e "\n${BLUE}Firewall Rules:${NC}" >&3
-        ip6tables -L -v 2>/dev/null || echo -e "${RED}No ip6tables rules${NC}" >&3
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
