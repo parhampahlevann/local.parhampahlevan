@@ -17,8 +17,7 @@ NC='\033[0m'
 
 # Initialize logging
 exec 3>&1 4>&2
-trap 'exec 2>&4 1>&3' 0 1 2 3
-exec > >(tee -a $LOG_FILE) 2>&1
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Check root
 if [ "$(id -u)" -ne 0 ]; then
@@ -55,12 +54,12 @@ cleanup() {
 # Verify tunnel interface
 verify_interface() {
     local timeout=10
-    while ((timeout > 0)); do
+    while [ $timeout -gt 0 ]; do
         if ip link show $TUNNEL_IFACE >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
-        ((timeout--))
+        timeout=$((timeout-1))
     done
     return 1
 }
@@ -86,14 +85,13 @@ install_deps() {
     read -p "Press [Enter] to return to main menu" <&3
 }
 
-# Method 1: Create tunnel using socat with GRE
+# Create tunnel methods
 create_tunnel_socat_gre() {
     echo -e "${BLUE}Creating tunnel using socat with GRE...${NC}" >&3
     nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
     sleep 3
 }
 
-# Method 2: Create tunnel using iproute2 (SIT)
 create_tunnel_iproute() {
     echo -e "${BLUE}Creating tunnel using iproute2 (SIT)...${NC}" >&3
     ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
@@ -101,7 +99,6 @@ create_tunnel_iproute() {
     sleep 2
 }
 
-# Method 3: Create tunnel using socat with raw IP
 create_tunnel_socat_raw() {
     echo -e "${BLUE}Creating tunnel using socat with raw IP...${NC}" >&3
     nohup socat TCP-LISTEN:$ALTERNATE_PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=ip,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
@@ -112,46 +109,38 @@ create_tunnel_socat_raw() {
 configure_tunnel() {
     echo -e "${BLUE}Configuring tunnel interface...${NC}" >&3
     
-    # Set MTU
     ip link set $TUNNEL_IFACE mtu 1400
-    
-    # Add IPv6 address
     ip addr add $LOCAL_IPV6 dev $TUNNEL_IFACE
-    
-    # Add IPv6 route
     ip route add ::/0 dev $TUNNEL_IFACE metric 100
     
-    # Enable IPv6 forwarding
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
     sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
     sysctl -w net.ipv6.conf.$TUNNEL_IFACE.forwarding=1 >/dev/null
     
-    # Configure firewall
     iptables -A INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
     iptables -A INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
     ip6tables -A FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -A FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     
-    # Save configuration
-    echo "LOCATION=$location" > $CONFIG_FILE
-    echo "IRAN_IPV4=$IRAN_IPV4" >> $CONFIG_FILE
-    echo "FOREIGN_IPV4=$FOREIGN_IPV4" >> $CONFIG_FILE
-    echo "PORT=$PORT" >> $CONFIG_FILE
-    echo "ALTERNATE_PORT=$ALTERNATE_PORT" >> $CONFIG_FILE
-    echo "LOCAL_IPV6=$LOCAL_IPV6" >> $CONFIG_FILE
-    echo "REMOTE_IPV6=$REMOTE_IPV6" >> $CONFIG_FILE
+    {
+        echo "LOCATION=$location"
+        echo "IRAN_IPV4=$IRAN_IPV4"
+        echo "FOREIGN_IPV4=$FOREIGN_IPV4"
+        echo "PORT=$PORT"
+        echo "ALTERNATE_PORT=$ALTERNATE_PORT"
+        echo "LOCAL_IPV6=$LOCAL_IPV6"
+        echo "REMOTE_IPV6=$REMOTE_IPV6"
+    } > $CONFIG_FILE
     
-    echo -e "${GREEN}Tunnel configuration saved successfully!${NC}" >&3
+    echo -e "${GREEN}Tunnel configuration saved!${NC}" >&3
 }
 
 # Create tunnel
 create_tunnel() {
-    # Get server information
-    echo -e "${YELLOW}Enter server information:${NC}" >&3
     read -p "Enter Iran server IPv4: " IRAN_IPV4
     read -p "Enter Foreign server IPv4: " FOREIGN_IPV4
     
-    echo -e "${YELLOW}Select your server location:${NC}" >&3
+    echo -e "${YELLOW}Select server location:${NC}" >&3
     select location in Iran Foreign; do
         case $location in
             Iran)
@@ -171,25 +160,30 @@ create_tunnel() {
         esac
     done
 
-    # Cleanup existing tunnel
     cleanup
     
-    # Try methods in order
     echo -e "${BLUE}Attempting to create tunnel...${NC}" >&3
-    create_tunnel_socat_gre || create_tunnel_iproute || create_tunnel_socat_raw
     
-    if ! verify_interface(); then
-        echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE' after multiple attempts${NC}" >&3
-        echo -e "${YELLOW}Troubleshooting steps:" >&3
-        echo "1. Check kernel modules: 'lsmod | grep -E \"gre|sit\"'" >&3
-        echo "2. Verify socat installation: 'socat -h'" >&3
-        echo "3. Check port availability: 'netstat -tulnp | grep -E \"$PORT|$ALTERNATE_PORT\"'" >&3
-        echo "4. Check system logs: 'journalctl -xe'" >&3
-        read -p "Press [Enter] to return to main menu" <&3
-        return 1
+    # Try methods sequentially
+    create_tunnel_socat_gre
+    if ! verify_interface; then
+        echo -e "${YELLOW}Method 1 failed, trying Method 2...${NC}" >&3
+        create_tunnel_iproute
+        if ! verify_interface; then
+            echo -e "${YELLOW}Method 2 failed, trying Method 3...${NC}" >&3
+            create_tunnel_socat_raw
+            if ! verify_interface; then
+                echo -e "${RED}Failed to create tunnel after all methods!${NC}" >&3
+                echo -e "${YELLOW}Troubleshooting steps:" >&3
+                echo "1. Check kernel modules: lsmod | grep gre" >&3
+                echo "2. Verify socat is installed: socat -h" >&3
+                echo "3. Check ports: netstat -tulnp | grep -E '$PORT|$ALTERNATE_PORT'" >&3
+                read -p "Press [Enter] to continue" <&3
+                return 1
+            fi
+        fi
     fi
 
-    # Configure the tunnel
     configure_tunnel
     
     echo -e "${GREEN}Tunnel created successfully!${NC}" >&3
@@ -197,42 +191,40 @@ create_tunnel() {
     echo -e "${YELLOW}Remote IPv6: $REMOTE_IPV6${NC}" >&3
     
     if [ "$location" == "Foreign" ]; then
-        echo -e "${BLUE}On the Iran server, run:${NC}" >&3
+        echo -e "${BLUE}On Iran server run:${NC}" >&3
         echo "nohup socat TCP:$FOREIGN_IPV4:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &" >&3
     fi
     
-    read -p "Press [Enter] to return to main menu" <&3
+    read -p "Press [Enter] to continue" <&3
 }
 
 # Remove tunnel
 remove_tunnel() {
     if [ ! -f $CONFIG_FILE ]; then
-        echo -e "${RED}No active tunnel configuration found.${NC}" >&3
-        read -p "Press [Enter] to return to main menu" <&3
+        echo -e "${RED}No active tunnel found.${NC}" >&3
+        read -p "Press [Enter] to continue" <&3
         return
     fi
     
     echo -e "${BLUE}Removing tunnel...${NC}" >&3
     cleanup
     
-    # Remove firewall rules
     iptables -D INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     
-    # Remove config file
     rm -f $CONFIG_FILE
     
     echo -e "${GREEN}Tunnel removed successfully!${NC}" >&3
-    read -p "Press [Enter] to return to main menu" <&3
+    read -p "Press [Enter] to continue" <&3
 }
 
 # Check connection
 check_connection() {
     if [ ! -f $CONFIG_FILE ]; then
-        echo -e "${RED}No active tunnel configuration found.${NC}" >&3
-        read -p "Press [Enter] to return to main menu" <&3
+        echo -e "${RED}No active tunnel found.${NC}" >&3
+        read -p "Press [Enter] to continue" <&3
         return
     fi
     
@@ -244,94 +236,75 @@ check_connection() {
         ping_target="${TUNNEL_PREFIX}::1"
     fi
     
-    echo -e "${BLUE}Testing connection to remote server...${NC}" >&3
-    ping6 -c 4 $ping_target
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Connection failed.${NC}" >&3
-        echo -e "${YELLOW}Troubleshooting info:" >&3
-        echo "Tunnel interface: $(ip link show $TUNNEL_IFACE 2>/dev/null)" >&3
-        echo "IPv6 address: $(ip -6 addr show $TUNNEL_IFACE 2>/dev/null)" >&3
-        echo "Routing table: $(ip -6 route show dev $TUNNEL_IFACE 2>/dev/null)" >&3
+    echo -e "${BLUE}Testing connection...${NC}" >&3
+    if ping6 -c 4 $ping_target; then
+        echo -e "${GREEN}Connection successful!${NC}" >&3
+    else
+        echo -e "${RED}Connection failed!${NC}" >&3
+        echo -e "${YELLOW}Troubleshooting:" >&3
+        echo "Interface: $(ip link show $TUNNEL_IFACE 2>/dev/null)" >&3
+        echo "IP Address: $(ip -6 addr show $TUNNEL_IFACE 2>/dev/null)" >&3
     fi
     
-    read -p "Press [Enter] to return to main menu" <&3
+    read -p "Press [Enter] to continue" <&3
 }
 
 # Show tunnel info
 show_info() {
     if [ ! -f $CONFIG_FILE ]; then
-        echo -e "${RED}No active tunnel configuration found.${NC}" >&3
-        read -p "Press [Enter] to return to main menu" <&3
+        echo -e "${RED}No active tunnel found.${NC}" >&3
+        read -p "Press [Enter] to continue" <&3
         return
     fi
     
     source $CONFIG_FILE
     
-    echo -e "${BLUE}Current Tunnel Configuration:${NC}" >&3
+    echo -e "${BLUE}Tunnel Configuration:${NC}" >&3
     echo -e "${YELLOW}Location: $LOCATION" >&3
     echo "Iran IPv4: $IRAN_IPV4" >&3
     echo "Foreign IPv4: $FOREIGN_IPV4" >&3
-    echo "Main Port: $PORT" >&3
-    echo "Alternate Port: $ALTERNATE_PORT" >&3
+    echo "Ports: $PORT (main), $ALTERNATE_PORT (alt)" >&3
     echo "Local IPv6: $LOCAL_IPV6" >&3
     echo "Remote IPv6: $REMOTE_IPV6${NC}" >&3
     
     echo -e "\n${BLUE}Interface Status:${NC}" >&3
-    ip link show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}Interface $TUNNEL_IFACE not found${NC}" >&3
+    ip link show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}Interface not found${NC}" >&3
     
     echo -e "\n${BLUE}IPv6 Address:${NC}" >&3
-    ip -6 addr show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 address assigned${NC}" >&3
+    ip -6 addr show $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 address${NC}" >&3
     
-    echo -e "\n${BLUE}IPv6 Route:${NC}" >&3
-    ip -6 route show dev $TUNNEL_IFACE 2>/dev/null || echo -e "${RED}No IPv6 routes found${NC}" >&3
-    
-    read -p "Press [Enter] to return to main menu" <&3
+    read -p "Press [Enter] to continue" <&3
 }
 
 # View logs
 view_logs() {
     if [ ! -f $LOG_FILE ]; then
         echo -e "${RED}No log file found.${NC}" >&3
-        read -p "Press [Enter] to return to main menu" <&3
-        return
+    else
+        echo -e "${BLUE}Last 20 lines of log:${NC}" >&3
+        tail -n 20 $LOG_FILE >&3
     fi
-    
-    echo -e "${BLUE}Showing last 50 lines of log:${NC}" >&3
-    tail -n 50 $LOG_FILE >&3
-    read -p "Press [Enter] to return to main menu" <&3
+    read -p "Press [Enter] to continue" <&3
 }
 
 # Main loop
 while true; do
     show_menu
-    read -p "Enter your choice [1-7]: " choice
+    read -p "Enter choice [1-7]: " choice
     
     case $choice in
-        1)
-            create_tunnel
-            ;;
-        2)
-            remove_tunnel
-            ;;
-        3)
-            check_connection
-            ;;
-        4)
-            show_info
-            ;;
-        5)
-            install_deps
-            ;;
-        6)
-            view_logs
-            ;;
-        7)
+        1) create_tunnel ;;
+        2) remove_tunnel ;;
+        3) check_connection ;;
+        4) show_info ;;
+        5) install_deps ;;
+        6) view_logs ;;
+        7) 
             echo -e "${GREEN}Exiting...${NC}" >&3
             exit 0
             ;;
-        *)
-            echo -e "${RED}Invalid option. Please try again.${NC}" >&3
+        *) 
+            echo -e "${RED}Invalid choice!${NC}" >&3
             sleep 1
             ;;
     esac
