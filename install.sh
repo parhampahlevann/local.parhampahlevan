@@ -46,10 +46,36 @@ install_deps() {
     echo -e "${BLUE}Installing dependencies...${NC}"
     if [ -f /etc/debian_version ]; then
         apt-get update
-        apt-get install -y iproute2 net-tools socat
+        apt-get install -y iproute2 net-tools socat kmod
     elif [ -f /etc/redhat-release ]; then
-        yum install -y iproute net-tools socat
+        yum install -y iproute net-tools socat kmod
     fi
+    
+    # Load GRE module
+    modprobe ip_gre
+    lsmod | grep gre
+}
+
+# Create tunnel using method 1 (socat)
+create_tunnel_method1() {
+    echo -e "${BLUE}Attempting to create tunnel using method 1 (socat)...${NC}"
+    nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
+    sleep 3
+}
+
+# Create tunnel using method 2 (iproute)
+create_tunnel_method2() {
+    echo -e "${BLUE}Attempting to create tunnel using method 2 (iproute)...${NC}"
+    ip tunnel add $TUNNEL_IFACE mode gre remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
+    ip link set $TUNNEL_IFACE up
+    sleep 2
+}
+
+# Create tunnel using method 3 (raw socket)
+create_tunnel_method3() {
+    echo -e "${BLUE}Attempting to create tunnel using method 3 (raw socket)...${NC}"
+    nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=ip,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
+    sleep 3
 }
 
 # Create tunnel
@@ -80,26 +106,17 @@ create_tunnel() {
     # Cleanup any existing tunnel
     cleanup
     
-    # Create TCP-encapsulated GRE tunnel
-    echo -e "${BLUE}Creating TCP-encapsulated GRE tunnel...${NC}"
-    nohup socat TCP-LISTEN:$PORT,fork,reuseaddr TUN:$TUNNEL_IFACE,tun-type=gre,tun-name=$TUNNEL_IFACE >/dev/null 2>&1 &
+    # Try multiple creation methods
+    create_tunnel_method1 || create_tunnel_method2 || create_tunnel_method3
     
     # Verify tunnel creation
     if ! verify_tunnel; then
-        echo -e "${RED}Failed to create tunnel interface. Retrying with different method...${NC}"
-        # Alternative creation method
-        ip tunnel add $TUNNEL_IFACE mode gre remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
-        ip link set $TUNNEL_IFACE up
-    fi
-
-    # Additional verification
-    if ! verify_tunnel; then
-        echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE'${NC}"
+        echo -e "${RED}Error: Could not create tunnel interface '$TUNNEL_IFACE' after multiple attempts${NC}"
         echo -e "${YELLOW}Troubleshooting steps:"
-        echo "1. Check if 'socat' is properly installed"
-        echo "2. Verify there are no conflicting interfaces"
-        echo "3. Try changing the tunnel interface name"
-        echo "4. Check system logs for errors (journalctl -xe)"
+        echo "1. Check if GRE module is loaded: 'lsmod | grep gre'"
+        echo "2. Verify socat is installed: 'socat -h'"
+        echo "3. Check for port conflict: 'netstat -tulnp | grep $PORT'"
+        echo "4. Try changing the tunnel interface name"
         exit 1
     fi
 
@@ -144,10 +161,11 @@ check_connection() {
         echo -e "${BLUE}Testing connection to remote server...${NC}"
         if ! ping6 -c 4 $ping_target; then
             echo -e "${RED}Connection failed. Troubleshooting:${NC}"
-            echo "1. Verify tunnel is up: ip link show $TUNNEL_IFACE"
-            echo "2. Check IP assignment: ip -6 addr show $TUNNEL_IFACE"
-            echo "3. Verify socat is running: ps aux | grep socat"
-            echo "4. Check firewall rules: ip6tables -L -n -v"
+            echo "1. Verify tunnel is up: 'ip link show $TUNNEL_IFACE'"
+            echo "2. Check IP assignment: 'ip -6 addr show $TUNNEL_IFACE'"
+            echo "3. Verify socat is running: 'ps aux | grep socat'"
+            echo "4. Check firewall rules: 'ip6tables -L -n -v'"
+            echo "5. Verify remote server is listening: 'nc -zv $REMOTE_IPV4 $PORT'"
         fi
     else
         echo -e "${RED}No active tunnel configuration found.${NC}"
