@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# تابع نمایش پیام با رنگ
+# Color message functions
 function colored_msg() {
     local color=$1
     local message=$2
@@ -13,15 +13,15 @@ function colored_msg() {
     esac
 }
 
-# تابع بررسی ریشه بودن کاربر
+# Check root access
 function check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        colored_msg red "این اسکریپت باید با دسترسی root اجرا شود."
+        colored_msg red "This script must be run as root."
         exit 1
     fi
 }
 
-# تابع بررسی سیستم عامل
+# Check OS compatibility
 function check_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -36,14 +36,14 @@ function check_os() {
     fi
 
     if [[ "$OS" != "ubuntu" && "$OS" != "debian" && "$OS" != "centos" && "$OS" != "fedora" ]]; then
-        colored_msg red "این اسکریپت فقط روی سیستم‌های مبتنی بر Debian/Ubuntu و RHEL/CentOS/Fedora پشتیبانی می‌شود."
+        colored_msg red "This script only supports Debian/Ubuntu and RHEL/CentOS/Fedora systems."
         exit 1
     fi
 }
 
-# تابع نصب بسته‌های لازم
+# Install required packages
 function install_dependencies() {
-    colored_msg blue "در حال بررسی و نصب بسته‌های لازم..."
+    colored_msg blue "Installing required packages..."
     
     if [ -f /etc/debian_version ]; then
         apt-get update
@@ -53,13 +53,13 @@ function install_dependencies() {
     fi
 }
 
-# تابع ایجاد تونل
+# Create IPv6 tunnel
 function create_tunnel() {
     local location=$1
     local iran_ipv4=$2
     local foreign_ipv4=$3
     
-    # پیشوند IPv6 مشترک
+    # Common IPv6 prefix
     local ipv6_prefix="fdbd:1b5d:0aa8"
     
     if [ "$location" == "iran" ]; then
@@ -74,66 +74,108 @@ function create_tunnel() {
         local remote_ipv4=$iran_ipv4
     fi
     
-    # ایجاد رابط تونل
+    # Create tunnel interface
     ip tunnel add ipv6tun mode sit remote $remote_ipv4 local $local_ipv4 ttl 255
     ip link set ipv6tun up
     ip addr add $local_ipv6 dev ipv6tun
     ip route add ::/0 dev ipv6tun
     
-    # فعال کردن IPv6
+    # Enable IPv6 forwarding
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
     echo 1 > /proc/sys/net/ipv6/conf/default/forwarding
     echo 1 > /proc/sys/net/ipv6/conf/ipv6tun/forwarding
     
-    colored_msg green "تونل IPv6 با موفقیت ایجاد شد!"
+    # Save config for uninstall
+    echo "$location $iran_ipv4 $foreign_ipv4" > /etc/ipv6tun.conf
+    
+    colored_msg green "IPv6 tunnel created successfully!"
     echo ""
-    colored_msg yellow "اطلاعات تونل:"
-    echo "آدرس IPv6 محلی: $local_ipv6"
-    echo "آدرس IPv6 ریموت: $remote_ipv6"
+    colored_msg yellow "Tunnel Information:"
+    echo "Local IPv6: $local_ipv6"
+    echo "Remote IPv6: $remote_ipv6"
     echo ""
-    colored_msg yellow "برای تست ارتباط، دستور زیر را در سرور مقابل اجرا کنید:"
+    colored_msg yellow "To test connection, run this command on the remote server:"
     colored_msg blue "ping6 $remote_ipv6"
 }
 
-# تابع اصلی
-function main() {
+# Remove tunnel and revert changes
+function remove_tunnel() {
+    if [ -f /etc/ipv6tun.conf ]; then
+        colored_msg blue "Removing IPv6 tunnel..."
+        
+        # Remove tunnel interface
+        ip link delete ipv6tun 2>/dev/null
+        
+        # Disable IPv6 forwarding
+        echo 0 > /proc/sys/net/ipv6/conf/all/forwarding
+        echo 0 > /proc/sys/net/ipv6/conf/default/forwarding
+        
+        # Remove config file
+        rm -f /etc/ipv6tun.conf
+        
+        colored_msg green "IPv6 tunnel removed successfully!"
+    else
+        colored_msg yellow "No IPv6 tunnel configuration found. Nothing to remove."
+    fi
+}
+
+# Main menu
+function main_menu() {
     clear
     colored_msg blue "===================================="
-    colored_msg blue "نصب کننده تونل IPv6 بین سرور ایران و خارج"
+    colored_msg blue "IPv6 Tunnel between Iran and Foreign"
     colored_msg blue "===================================="
     echo ""
     
-    check_root
-    check_os
-    install_dependencies
-    
-    # انتخاب موقعیت سرور
-    PS3="لطفاً موقعیت این سرور را انتخاب کنید: "
-    options=("ایران" "خارج")
+    PS3="Please select an option: "
+    options=("Create IPv6 Tunnel" "Remove IPv6 Tunnel" "Exit")
     select opt in "${options[@]}"
     do
         case $opt in
-            "ایران")
-                location="iran"
+            "Create IPv6 Tunnel")
+                check_root
+                check_os
+                install_dependencies
+                
+                PS3="Select server location: "
+                locations=("Iran" "Foreign")
+                select loc in "${locations[@]}"
+                do
+                    case $loc in
+                        "Iran")
+                            location="iran"
+                            break
+                            ;;
+                        "Foreign")
+                            location="foreign"
+                            break
+                            ;;
+                        *) echo "Invalid option";;
+                    esac
+                done
+                
+                echo ""
+                colored_msg yellow "Please enter required information:"
+                read -p "Iran server IPv4: " iran_ipv4
+                read -p "Foreign server IPv4: " foreign_ipv4
+                
+                echo ""
+                colored_msg blue "Creating IPv6 tunnel..."
+                create_tunnel "$location" "$iran_ipv4" "$foreign_ipv4"
                 break
                 ;;
-            "خارج")
-                location="foreign"
+            "Remove IPv6 Tunnel")
+                check_root
+                remove_tunnel
                 break
                 ;;
-            *) echo "گزینه نامعتبر";;
+            "Exit")
+                exit 0
+                ;;
+            *) echo "Invalid option";;
         esac
     done
-    
-    echo ""
-    colored_msg yellow "لطفاً اطلاعات مورد نیاز را وارد کنید:"
-    read -p "آدرس IPv4 سرور ایران: " iran_ipv4
-    read -p "آدرس IPv4 سرور خارج: " foreign_ipv4
-    
-    echo ""
-    colored_msg blue "در حال ایجاد تونل IPv6..."
-    create_tunnel "$location" "$iran_ipv4" "$foreign_ipv4"
 }
 
-# اجرای تابع اصلی
-main
+# Execute main menu
+main_menu
