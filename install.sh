@@ -15,7 +15,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Initialize logging (ساده‌تر شده برای دیباگ)
+# Initialize logging
 echo "Script started at $(date)" > "$LOG_FILE" 2>&1
 exec 3>&1
 
@@ -153,8 +153,14 @@ install_deps() {
 # Create tunnel using iproute2 (SIT)
 create_tunnel_iproute() {
     echo -e "${BLUE}Creating tunnel using iproute2 (SIT)...${NC}" >&3
-    ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255 2>>"$LOG_FILE"
-    ip link set $TUNNEL_IFACE up mtu $MTU_SIZE 2>>"$LOG_FILE"
+    ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255 2>>"$LOG_FILE" || {
+        echo -e "${RED}Failed to create tunnel interface. Check logs.${NC}" >&3
+        return 1
+    }
+    ip link set $TUNNEL_IFACE up mtu $MTU_SIZE 2>>"$LOG_FILE" || {
+        echo -e "${RED}Failed to bring up tunnel interface. Check logs.${NC}" >&3
+        return 1
+    }
     sleep 2
 }
 
@@ -190,17 +196,25 @@ configure_tunnel() {
     ip link set $TUNNEL_IFACE mtu $MTU_SIZE 2>>"$LOG_FILE"
     
     # Add IPv6 address with proper syntax
-    ip -6 addr add $LOCAL_IPV6 dev $TUNNEL_IFACE 2>>"$LOG_FILE"
+    ip -6 addr add $LOCAL_IPV6 dev $TUNNEL_IFACE 2>>"$LOG_FILE" || {
+        echo -e "${RED}Failed to set IPv6 address $LOCAL_IPV6. Check permissions, syntax, or if interface exists.${NC}" >&3
+        ip link show $TUNNEL_IFACE >&3 2>>"$LOG_FILE"
+        return 1
+    }
+    
     ip -6 addr show dev $TUNNEL_IFACE | grep $LOCAL_IPV6 || {
-        echo -e "${RED}Failed to set IPv6 address $LOCAL_IPV6. Check permissions or syntax.${NC}" >&3
-        exit 1
+        echo -e "${RED}Failed to verify IPv6 address $LOCAL_IPV6. Check logs.${NC}" >&3
+        return 1
     }
     
     # Add IPv6 route
-    ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100 2>>"$LOG_FILE"
-    ip -6 route show dev $TUNNEL_IFACE | grep "::/0" || {
+    ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100 2>>"$LOG_FILE" || {
         echo -e "${RED}Failed to add IPv6 default route. Check routing table.${NC}" >&3
-        exit 1
+        return 1
+    }
+    ip -6 route show dev $TUNNEL_IFACE | grep "::/0" || {
+        echo -e "${RED}Failed to verify IPv6 default route. Check logs.${NC}" >&3
+        return 1
     }
     
     # Enable IPv6 forwarding
