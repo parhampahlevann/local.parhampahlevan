@@ -326,8 +326,8 @@ create_tunnel() {
         echo "iptables -A OUTPUT -p 41 -s $FOREIGN_IPV4 -d $IRAN_IPV4 -j ACCEPT" >&3
         echo -e "${YELLOW}Please confirm execution on Foreign server before proceeding.${NC}" >&3
         read -p "Press [Enter] after executing commands on Foreign server" <&3
-    end
-
+    fi
+    
     # Advanced connectivity test
     echo -e "${BLUE}Testing connection...${NC}" >&3
     check_connection
