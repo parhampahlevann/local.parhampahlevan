@@ -166,10 +166,15 @@ test_mtu() {
         echo -e "${YELLOW}MTU $MTU_SIZE failed, trying lower MTU (1200)...${NC}" >&3
         MTU_SIZE=1200
         ip link set $TUNNEL_IFACE mtu $MTU_SIZE
-        if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>&1; then
-            echo -e "${GREEN}MTU adjusted to $MTU_SIZE successfully!${NC}" >&3
-        else
+        if ! ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>&1; then
+            echo -e "${YELLOW}MTU 1200 failed, trying 1480...${NC}" >&3
+            MTU_SIZE=1480
+            ip link set $TUNNEL_IFACE mtu $MTU_SIZE
+        fi
+        if ! ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>&1; then
             echo -e "${RED}MTU test failed. Please check network configuration.${NC}" >&3
+        else
+            echo -e "${GREEN}MTU adjusted to $MTU_SIZE successfully!${NC}" >&3
         fi
     else
         echo -e "${GREEN}MTU test passed with $MTU_SIZE!${NC}" >&3
@@ -186,9 +191,17 @@ configure_tunnel() {
     
     # Add IPv6 address with proper syntax
     ip -6 addr add $LOCAL_IPV6 dev $TUNNEL_IFACE
+    ip -6 addr show dev $TUNNEL_IFACE | grep $LOCAL_IPV6 || {
+        echo -e "${RED}Failed to set IPv6 address $LOCAL_IPV6. Check permissions or syntax.${NC}" >&3
+        exit 1
+    }
     
     # Add IPv6 route
     ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100
+    ip -6 route show dev $TUNNEL_IFACE | grep "::/0" || {
+        echo -e "${RED}Failed to add IPv6 default route. Check routing table.${NC}" >&3
+        exit 1
+    }
     
     # Enable IPv6 forwarding
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
@@ -290,7 +303,7 @@ create_tunnel() {
     echo -e "${YELLOW}Remote IPv6: $REMOTE_IPV6${NC}" >&3
     
     if [ "$location" == "Foreign" ]; then
-        echo -e "${BLUE}On the Iran server, run these commands:${NC}" >&3
+        echo -e "${BLUE}On the Iran server ($IRAN_IPV4), run these commands immediately:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $FOREIGN_IPV4 local $IRAN_IPV4 ttl 255" >&3
         echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip -6 addr add ${TUNNEL_PREFIX}::1/64 dev $TUNNEL_IFACE" >&3
@@ -299,8 +312,10 @@ create_tunnel() {
         echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
         echo "iptables -A INPUT -p 41 -s $FOREIGN_IPV4 -d $IRAN_IPV4 -j ACCEPT" >&3
         echo "iptables -A OUTPUT -p 41 -s $IRAN_IPV4 -d $FOREIGN_IPV4 -j ACCEPT" >&3
+        echo -e "${YELLOW}Please confirm execution on Iran server before proceeding.${NC}" >&3
+        read -p "Press [Enter] after executing commands on Iran server" <&3
     else
-        echo -e "${BLUE}On the Foreign server, run these commands:${NC}" >&3
+        echo -e "${BLUE}On the Foreign server ($FOREIGN_IPV4), run these commands immediately:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $IRAN_IPV4 local $FOREIGN_IPV4 ttl 255" >&3
         echo "ip link set $TUNNEL_IFACE up mtu $MTU_SIZE" >&3
         echo "ip -6 addr add ${TUNNEL_PREFIX}::2/64 dev $TUNNEL_IFACE" >&3
@@ -309,8 +324,10 @@ create_tunnel() {
         echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
         echo "iptables -A INPUT -p 41 -s $IRAN_IPV4 -d $FOREIGN_IPV4 -j ACCEPT" >&3
         echo "iptables -A OUTPUT -p 41 -s $FOREIGN_IPV4 -d $IRAN_IPV4 -j ACCEPT" >&3
-    fi
-    
+        echo -e "${YELLOW}Please confirm execution on Foreign server before proceeding.${NC}" >&3
+        read -p "Press [Enter] after executing commands on Foreign server" <&3
+    end
+
     # Advanced connectivity test
     echo -e "${BLUE}Testing connection...${NC}" >&3
     check_connection
@@ -382,6 +399,10 @@ check_connection() {
         ip -6 route show dev $TUNNEL_IFACE >&3
         echo -e "${YELLOW}Checking kernel logs for errors:" >&3
         dmesg | tail -n 20 >&3
+        echo -e "${YELLOW}Troubleshooting steps:" >&3
+        echo "1. Verify IPv6 address is set on both servers." >&3
+        echo "2. Check firewall rules on both servers: 'iptables -L -v -n' and 'ip6tables -L -v -n'." >&3
+        echo "3. Ensure both servers have matching MTU settings." >&3
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
