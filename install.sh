@@ -3,11 +3,9 @@
 # Configuration
 TUNNEL_IFACE="iranv6tun"
 TUNNEL_PREFIX="fdbd:1b5d:0aa8"
-PORT=8080
-ALTERNATE_PORT=8081
 CONFIG_FILE="/etc/iranv6tun.conf"
 LOG_FILE="/var/log/iranv6tun.log"
-MTU_SIZE=1280  # Optimal MTU for IPv6 tunnels
+MTU_SIZE=1280  # Default MTU for IPv6 tunnels
 BACKUP_FILE="/etc/iranv6tun_backup.conf"
 
 # Colors
@@ -94,14 +92,14 @@ restore_config() {
 basic_cleanup() {
     echo -e "${BLUE}Performing basic cleanup...${NC}" >&3
     
-    pkill -f "socat TCP.*$TUNNEL_IFACE" 2>/dev/null
     ip link delete $TUNNEL_IFACE 2>/dev/null
     ip -6 addr flush dev $TUNNEL_IFACE 2>/dev/null
     ip -6 route flush dev $TUNNEL_IFACE 2>/dev/null
     rm -f "$CONFIG_FILE"
     
-    ip6tables -D INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
-    ip6tables -D INPUT -p tcp --dport $ALTERNATE_PORT -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p 41 -j ACCEPT 2>/dev/null
+    iptables -D OUTPUT -p 41 -j ACCEPT 2>/dev/null
+    ip6tables -D INPUT -p ipv6-icmp -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -i $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     ip6tables -D FORWARD -o $TUNNEL_IFACE -j ACCEPT 2>/dev/null
     
@@ -127,14 +125,26 @@ install_deps() {
     
     if [ -f /etc/debian_version ]; then
         apt-get update
-        apt-get install -y iproute2 net-tools socat kmod traceroute6
+        apt-get install -y iproute2 net-tools kmod traceroute6
     elif [ -f /etc/redhat-release ]; then
-        yum install -y iproute net-tools socat kmod traceroute
+        yum install -y iproute net-tools kmod traceroute
     fi
     
-    modprobe ip_gre 2>/dev/null
-    modprobe ip6_gre 2>/dev/null
-    modprobe sit 2>/dev/null
+    # Check and enable IPv6
+    if ! sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -q 0; then
+        echo -e "${YELLOW}IPv6 is disabled. Enabling IPv6...${NC}" >&3
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0
+    fi
+    
+    # Verify kernel modules
+    if ! lsmod | grep -q sit; then
+        echo -e "${RED}SIT module not loaded. Loading...${NC}" >&3
+        modprobe sit
+        if ! lsmod | grep -q sit; then
+            echo -e "${RED}Failed to load SIT module. Please check kernel support.${NC}" >&3
+            exit 1
+        fi
+    fi
     
     echo -e "${GREEN}Dependencies installed successfully!${NC}" >&3
     read -p "Press [Enter] to return to main menu" <&3
@@ -146,6 +156,24 @@ create_tunnel_iproute() {
     ip tunnel add $TUNNEL_IFACE mode sit remote $REMOTE_IPV4 local $LOCAL_IPV4 ttl 255
     ip link set $TUNNEL_IFACE up mtu $MTU_SIZE
     sleep 2
+}
+
+# Test and adjust MTU
+test_mtu() {
+    echo -e "${YELLOW}Testing MTU compatibility...${NC}" >&3
+    local test_mtu=$((MTU_SIZE-48))
+    if ! ping6 -c 4 -M do -s $test_mtu $REMOTE_IPV6 >/dev/null 2>&1; then
+        echo -e "${YELLOW}MTU $MTU_SIZE failed, trying lower MTU (1200)...${NC}" >&3
+        MTU_SIZE=1200
+        ip link set $TUNNEL_IFACE mtu $MTU_SIZE
+        if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>&1; then
+            echo -e "${GREEN}MTU adjusted to $MTU_SIZE successfully!${NC}" >&3
+        else
+            echo -e "${RED}MTU test failed. Please check network configuration.${NC}" >&3
+        fi
+    else
+        echo -e "${GREEN}MTU test passed with $MTU_SIZE!${NC}" >&3
+    fi
 }
 
 # Configure tunnel with enhanced connectivity settings
@@ -171,14 +199,21 @@ configure_tunnel() {
     ip6tables -F
     ip6tables -X
     ip6tables -Z
+    iptables -F
+    iptables -X
+    iptables -Z
     
-    # Essential IPv6 firewall rules
+    # Essential IPv6 and IPv4 firewall rules
     ip6tables -P INPUT ACCEPT
     ip6tables -P FORWARD ACCEPT
     ip6tables -P OUTPUT ACCEPT
     ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
     ip6tables -A FORWARD -i $TUNNEL_IFACE -j ACCEPT
     ip6tables -A FORWARD -o $TUNNEL_IFACE -j ACCEPT
+    
+    # Allow SIT protocol (41) for IPv4
+    iptables -A INPUT -p 41 -s $REMOTE_IPV4 -d $LOCAL_IPV4 -j ACCEPT
+    iptables -A OUTPUT -p 41 -s $LOCAL_IPV4 -d $REMOTE_IPV4 -j ACCEPT
     
     # Save configuration
     {
@@ -248,6 +283,7 @@ create_tunnel() {
     fi
 
     configure_tunnel
+    test_mtu
     
     echo -e "${GREEN}Tunnel created successfully!${NC}" >&3
     echo -e "${YELLOW}Local IPv6: $LOCAL_IPV6${NC}" >&3
@@ -261,6 +297,8 @@ create_tunnel() {
         echo "ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
         echo "sysctl -w net.ipv6.conf.all.forwarding=1" >&3
         echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
+        echo "iptables -A INPUT -p 41 -s $FOREIGN_IPV4 -d $IRAN_IPV4 -j ACCEPT" >&3
+        echo "iptables -A OUTPUT -p 41 -s $IRAN_IPV4 -d $FOREIGN_IPV4 -j ACCEPT" >&3
     else
         echo -e "${BLUE}On the Foreign server, run these commands:${NC}" >&3
         echo "ip tunnel add $TUNNEL_IFACE mode sit remote $IRAN_IPV4 local $FOREIGN_IPV4 ttl 255" >&3
@@ -269,34 +307,13 @@ create_tunnel() {
         echo "ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100" >&3
         echo "sysctl -w net.ipv6.conf.all.forwarding=1" >&3
         echo "sysctl -w net.ipv6.conf.default.forwarding=1" >&3
+        echo "iptables -A INPUT -p 41 -s $IRAN_IPV4 -d $FOREIGN_IPV4 -j ACCEPT" >&3
+        echo "iptables -A OUTPUT -p 41 -s $FOREIGN_IPV4 -d $IRAN_IPV4 -j ACCEPT" >&3
     fi
     
     # Advanced connectivity test
     echo -e "${BLUE}Testing connection...${NC}" >&3
-    echo -e "${YELLOW}Step 1: Basic ping test...${NC}" >&3
-    
-    if ping6 -c 4 $REMOTE_IPV6; then
-        echo -e "${GREEN}Basic ping test successful!${NC}" >&3
-        
-        echo -e "${YELLOW}Step 2: Testing with MTU $MTU_SIZE...${NC}" >&3
-        if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6; then
-            echo -e "${GREEN}MTU test successful with packet size $((MTU_SIZE-48))!${NC}" >&3
-        else
-            echo -e "${YELLOW}MTU test failed, but basic connectivity works.${NC}" >&3
-        fi
-        
-        echo -e "${YELLOW}Step 3: Traceroute test...${NC}" >&3
-        traceroute6 -n $REMOTE_IPV6
-    else
-        echo -e "${RED}Connection failed completely${NC}" >&3
-        echo -e "${YELLOW}Troubleshooting steps:" >&3
-        echo "1. Verify tunnel is up on both servers" >&3
-        echo "2. Check firewall rules on both servers" >&3
-        echo "3. Verify physical network connectivity" >&3
-        echo "4. Check IP addresses configuration" >&3
-    fi
-    
-    read -p "Press [Enter] to return to main menu" <&3
+    check_connection
 }
 
 # Remove tunnel (Complete Uninstall)
@@ -330,31 +347,41 @@ check_connection() {
         ping_target="${TUNNEL_PREFIX}::1"
     fi
     
-    echo -e "${BLUE}Testing connection to remote server...${NC}" >&3
-    echo -e "${YELLOW}Step 1: Basic ping test...${NC}" >&3
+    echo -e "${BLUE}Testing connection to remote server ($ping_target)...${NC}" >&3
     
-    if ping6 -c 4 $ping_target; then
+    # Check IPv4 connectivity first
+    echo -e "${YELLOW}Step 1: Testing IPv4 connectivity to $REMOTE_IPV4...${NC}" >&3
+    if ping -c 4 $REMOTE_IPV4 >/dev/null 2>&1; then
+        echo -e "${GREEN}IPv4 connectivity OK${NC}" >&3
+    else
+        echo -e "${RED}IPv4 connectivity failed. Please check network or firewall.${NC}" >&3
+        read -p "Press [Enter] to return to main menu" <&3
+        return
+    fi
+    
+    echo -e "${YELLOW}Step 2: Basic IPv6 ping test...${NC}" >&3
+    if ping6 -c 4 $ping_target >/dev/null 2>&1; then
         echo -e "${GREEN}Basic ping test successful!${NC}" >&3
         
-        echo -e "${YELLOW}Step 2: Testing with MTU $MTU_SIZE...${NC}" >&3
-        if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $ping_target; then
+        echo -e "${YELLOW}Step 3: Testing with MTU $MTU_SIZE...${NC}" >&3
+        if ping6 -c 4 -M do -s $((MTU_SIZE-48)) $ping_target >/dev/null 2>&1; then
             echo -e "${GREEN}MTU test successful with packet size $((MTU_SIZE-48))!${NC}" >&3
         else
             echo -e "${YELLOW}MTU test failed, but basic connectivity works.${NC}" >&3
         fi
         
-        echo -e "${YELLOW}Step 3: Traceroute test...${NC}" >&3
-        traceroute6 -n $ping_target
+        echo -e "${YELLOW}Step 4: Traceroute test...${NC}" >&3
+        traceroute6 -n $ping_target >&3
     else
-        echo -e "${RED}Connection failed completely${NC}" >&3
+        echo -e "${RED}IPv6 connection failed completely${NC}" >&3
         echo -e "${YELLOW}Interface status:" >&3
         ip link show $TUNNEL_IFACE >&3
-        
         echo -e "${YELLOW}IPv6 address:" >&3
         ip -6 addr show $TUNNEL_IFACE >&3
-        
         echo -e "${YELLOW}IPv6 route:" >&3
         ip -6 route show dev $TUNNEL_IFACE >&3
+        echo -e "${YELLOW}Checking kernel logs for errors:" >&3
+        dmesg | tail -n 20 >&3
     fi
     
     read -p "Press [Enter] to return to main menu" <&3
