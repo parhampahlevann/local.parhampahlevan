@@ -2,7 +2,7 @@
 
 # Configuration
 TUNNEL_IFACE="iranv6tun"
-TUNNEL_PREFIX="fdbd:1b5d:0aa8"
+TUNNEL_PREFIX="fdbd:1b5d:0aa8"  # تصحیح شده برای اطمینان
 CONFIG_FILE="/etc/iranv6tun.conf"
 LOG_FILE="/var/log/iranv6tun.log"
 MTU_SIZE=1280  # Default MTU for IPv6 tunnels
@@ -164,26 +164,31 @@ create_tunnel_iproute() {
     sleep 2
 }
 
-# Test and adjust MTU
+# Test and adjust MTU with more options
 test_mtu() {
     echo -e "${YELLOW}Testing MTU compatibility...${NC}" >&3
-    local test_mtu=$((MTU_SIZE-48))
-    if ! ping6 -c 4 -M do -s $test_mtu $REMOTE_IPV6 >/dev/null 2>>"$LOG_FILE"; then
-        echo -e "${YELLOW}MTU $MTU_SIZE failed, trying lower MTU (1200)...${NC}" >&3
-        MTU_SIZE=1200
-        ip link set $TUNNEL_IFACE mtu $MTU_SIZE 2>>"$LOG_FILE"
-        if ! ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>>"$LOG_FILE"; then
-            echo -e "${YELLOW}MTU 1200 failed, trying 1480...${NC}" >&3
-            MTU_SIZE=1480
+    local test_sizes=(1232 1152 1472)  # MTU - 48 for 1280, 1200, 1480
+    local success=false
+    
+    for size in "${test_sizes[@]}"; do
+        echo -e "${YELLOW}Testing MTU with packet size $size...${NC}" >&3
+        if ping6 -c 4 -M do -s $size $REMOTE_IPV6 >/dev/null 2>>"$LOG_FILE"; then
+            echo -e "${GREEN}MTU test successful with packet size $size!${NC}" >&3
+            MTU_SIZE=$((size + 48))
             ip link set $TUNNEL_IFACE mtu $MTU_SIZE 2>>"$LOG_FILE"
-        fi
-        if ! ping6 -c 4 -M do -s $((MTU_SIZE-48)) $REMOTE_IPV6 >/dev/null 2>>"$LOG_FILE"; then
-            echo -e "${RED}MTU test failed. Please check network configuration.${NC}" >&3
+            success=true
+            break
         else
-            echo -e "${GREEN}MTU adjusted to $MTU_SIZE successfully!${NC}" >&3
+            echo -e "${YELLOW}MTU test failed with packet size $size.${NC}" >&3
         fi
+    done
+    
+    if [ "$success" = false ]; then
+        echo -e "${RED}MTU test failed. Please check network configuration!${NC}" >&3
+        echo -e "${YELLOW}Suggested MTU values to try manually: 1200, 1280, 1480${NC}" >&3
+        echo -e "${YELLOW}Check firewall rules and network path for MTU restrictions.${NC}" >&3
     else
-        echo -e "${GREEN}MTU test passed with $MTU_SIZE!${NC}" >&3
+        echo -e "${GREEN}MTU adjusted to $MTU_SIZE successfully!${NC}" >&3
     fi
 }
 
@@ -202,10 +207,12 @@ configure_tunnel() {
         return 1
     }
     
-    ip -6 addr show dev $TUNNEL_IFACE | grep $LOCAL_IPV6 || {
+    # Verify IPv6 address
+    if ! ip -6 addr show dev $TUNNEL_IFACE | grep -q "$LOCAL_IPV6"; then
         echo -e "${RED}Failed to verify IPv6 address $LOCAL_IPV6. Check logs.${NC}" >&3
+        ip -6 addr show dev $TUNNEL_IFACE >&3 2>>"$LOG_FILE"
         return 1
-    }
+    fi
     
     # Add IPv6 route
     ip -6 route add ::/0 dev $TUNNEL_IFACE metric 100 2>>"$LOG_FILE" || {
