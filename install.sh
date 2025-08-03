@@ -51,6 +51,14 @@ function install_dependencies() {
     fi
 }
 
+# Load required kernel modules
+function load_modules() {
+    colored_msg blue "Loading required kernel modules..."
+    modprobe sit
+    modprobe tunnel4
+    modprobe ip6_tunnel
+}
+
 # Configure firewall for IPv6 tunnel
 function configure_firewall() {
     colored_msg blue "Configuring firewall for IPv6 tunnel..."
@@ -68,17 +76,17 @@ function configure_firewall() {
     fi
     
     # For systems with firewalld
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-protocol=41
-        firewall-cmd --permanent --add-protocol=ipv6-icmp
-        firewall-cmd --reload
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-protocol=41 >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-protocol=ipv6-icmp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
     fi
     
     # For systems with ufw
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow proto 41
-        ufw allow ipv6
-        ufw reload
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+        ufw allow proto 41 >/dev/null 2>&1 || true
+        ufw allow ipv6 >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
     fi
 }
 
@@ -103,6 +111,9 @@ function create_tunnel() {
         local remote_ipv4=$iran_ipv4
     fi
     
+    # Load kernel modules
+    load_modules
+    
     # Remove any existing tunnel
     ip link del ipv6tun 2>/dev/null
     
@@ -112,20 +123,24 @@ function create_tunnel() {
     # Set MTU to 1480 (standard for IPv6 in IPv4 tunnel)
     ip link set ipv6tun mtu 1480 up
     
-    # Assign IPv6 addresses with point-to-point configuration
+    # Assign IPv6 addresses
     ip addr add $local_ipv6 dev ipv6tun
     
     # Add route for remote IPv6 through the tunnel
     ip -6 route add $remote_ipv6 dev ipv6tun
     
-    # Enable IPv6 forwarding
+    # Enable IPv6 forwarding and other settings
     sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null
     sysctl -w net.ipv6.conf.default.forwarding=1 > /dev/null
     sysctl -w net.ipv6.conf.ipv6tun.forwarding=1 > /dev/null
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 > /dev/null
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 > /dev/null
+    sysctl -w net.ipv6.conf.ipv6tun.disable_ipv6=0 > /dev/null
     
     # Enable neighbor discovery
     sysctl -w net.ipv6.conf.all.accept_ra=2 > /dev/null
     sysctl -w net.ipv6.conf.default.accept_ra=2 > /dev/null
+    sysctl -w net.ipv6.conf.ipv6tun.accept_ra=2 > /dev/null
     
     # Configure firewall
     configure_firewall
@@ -140,10 +155,42 @@ function create_tunnel() {
     echo "Remote IPv6: $remote_ipv6"
     echo ""
     colored_msg yellow "To test connection, run this command on the remote server:"
-    colored_msg blue "ping6 $remote_ipv6"
-    echo ""
-    colored_msg yellow "To test from this server:"
     colored_msg blue "ping6 -I ipv6tun $remote_ipv6"
+}
+
+# Test the tunnel connection
+function test_tunnel() {
+    if [ -f /etc/ipv6tun.conf ]; then
+        colored_msg blue "Testing IPv6 tunnel connection..."
+        
+        # Read config
+        local location=$(awk '{print $1}' /etc/ipv6tun.conf)
+        local iran_ipv4=$(awk '{print $2}' /etc/ipv6tun.conf)
+        local foreign_ipv4=$(awk '{print $3}' /etc/ipv6tun.conf)
+        
+        local ipv6_prefix="fdbd:1b5d:0aa8"
+        if [ "$location" == "iran" ]; then
+            local remote_ipv6="${ipv6_prefix}::2"
+        else
+            local remote_ipv6="${ipv6_prefix}::1"
+        fi
+        
+        # Test ping
+        colored_msg yellow "Pinging remote IPv6 address: $remote_ipv6"
+        if ping6 -c 3 -I ipv6tun $remote_ipv6 >/dev/null 2>&1; then
+            colored_msg green "Ping successful! Tunnel is working."
+        else
+            colored_msg red "Ping failed. Tunnel may not be working correctly."
+            colored_msg yellow "Troubleshooting tips:"
+            echo "1. Check if protocol 41 is allowed on firewalls between the servers."
+            echo "2. Verify that the tunnel is up on both servers: ip link show ipv6tun"
+            echo "3. Check IPv6 addresses: ip -6 addr show dev ipv6tun"
+            echo "4. Check routes: ip -6 route show"
+            echo "5. Try to ping the remote IPv4 address: ping -c 3 $remote_ipv4"
+        fi
+    else
+        colored_msg yellow "No IPv6 tunnel configuration found. Cannot test."
+    fi
 }
 
 # Remove tunnel and revert changes
@@ -176,7 +223,7 @@ function main_menu() {
     echo ""
     
     PS3="Please select an option: "
-    options=("Create IPv6 Tunnel" "Remove IPv6 Tunnel" "Exit")
+    options=("Create IPv6 Tunnel" "Test Tunnel Connection" "Remove IPv6 Tunnel" "Exit")
     select opt in "${options[@]}"
     do
         case $opt in
@@ -210,6 +257,11 @@ function main_menu() {
                 echo ""
                 colored_msg blue "Creating IPv6 tunnel..."
                 create_tunnel "$location" "$iran_ipv4" "$foreign_ipv4"
+                break
+                ;;
+            "Test Tunnel Connection")
+                check_root
+                test_tunnel
                 break
                 ;;
             "Remove IPv6 Tunnel")
