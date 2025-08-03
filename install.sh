@@ -135,8 +135,8 @@ function create_tunnel() {
     local iran_ipv4=$2
     local foreign_ipv4=$3
     
-    # Common IPv6 prefix
-    local ipv6_prefix="fdbd:1b5d:0aa8"
+    # Common IPv6 prefix - Using unique local addresses (ULA)
+    local ipv6_prefix="fd00:1234:5678:9abc"
     
     if [ "$location" == "iran" ]; then
         local local_ipv6="${ipv6_prefix}::1/64"
@@ -196,7 +196,7 @@ function create_network_config() {
     local iran_ipv4=$2
     local foreign_ipv4=$3
     
-    local ipv6_prefix="fdbd:1b5d:0aa8"
+    local ipv6_prefix="fd00:1234:5678:9abc"
     
     if [ "$location" == "iran" ]; then
         local local_ipv6="${ipv6_prefix}::1/64"
@@ -241,7 +241,7 @@ function test_tunnel() {
         local iran_ipv4=$(awk '{print $2}' /etc/ipv6tun.conf)
         local foreign_ipv4=$(awk '{print $3}' /etc/ipv6tun.conf)
         
-        local ipv6_prefix="fdbd:1b5d:0aa8"
+        local ipv6_prefix="fd00:1234:5678:9abc"
         if [ "$location" == "iran" ]; then
             local remote_ipv6="${ipv6_prefix}::2"
         else
