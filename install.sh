@@ -1,15 +1,14 @@
 #!/bin/bash
-
 # Color message functions
 function colored_msg() {
     local color=$1
     local message=$2
     case $color in
-        red) echo -e "\033[31m$message\033[0m" ;;
-        green) echo -e "\033[32m$message\033[0m" ;;
-        yellow) echo -e "\033[33m$message\033[0m" ;;
-        blue) echo -e "\033[34m$message\033[0m" ;;
-        *) echo "$message" ;;
+        red) printf "\033[31m%s\033[0m\n" "$message" ;;
+        green) printf "\033[32m%s\033[0m\n" "$message" ;;
+        yellow) printf "\033[33m%s\033[0m\n" "$message" ;;
+        blue) printf "\033[34m%s\033[0m\n" "$message" ;;
+        *) printf "%s\n" "$message" ;;
     esac
 }
 
@@ -25,7 +24,7 @@ function check_root() {
 function check_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        OS=$ID
+        OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
         VER=$VERSION_ID
     elif type lsb_release >/dev/null 2>&1; then
         OS=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
@@ -34,6 +33,7 @@ function check_os() {
         OS=$(uname -s | tr '[:upper:]' '[:lower:]')
         VER=$(uname -r)
     fi
+    
     if [[ "$OS" != "ubuntu" && "$OS" != "debian" && "$OS" != "centos" && "$OS" != "fedora" ]]; then
         colored_msg red "This script only supports Debian/Ubuntu and RHEL/CentOS/Fedora systems."
         exit 1
@@ -45,20 +45,28 @@ function install_dependencies() {
     colored_msg blue "Installing required packages..."
     
     if [ -f /etc/debian_version ]; then
-        apt-get update
-        apt-get install -y iproute2 net-tools sed grep iputils-ping curl netcat-openbsd
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y iproute net-tools sed grep iputils curl nmap-ncat
+        apt-get update >/dev/null 2>&1
+        apt-get install -y iproute2 net-tools sed grep iputils-ping curl netcat-openbsd >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ] || [ "$OS" == "fedora" ]; then
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y iproute net-tools sed grep iputils curl nmap-ncat >/dev/null 2>&1
+        else
+            yum install -y iproute net-tools sed grep iputils curl nmap-ncat >/dev/null 2>&1
+        fi
     fi
 }
 
 # Load required kernel modules
 function load_modules() {
     colored_msg blue "Loading required kernel modules..."
-    modprobe sit
-    modprobe tunnel4
-    modprobe ip6_tunnel
-    modprobe ip6_gre
+    
+    modprobe sit >/dev/null 2>&1
+    modprobe tunnel4 >/dev/null 2>&1
+    modprobe ip6_tunnel >/dev/null 2>&1
+    modprobe ip6_gre >/dev/null 2>&1
+    
+    # Create modules-load.d directory if it doesn't exist
+    mkdir -p /etc/modules-load.d
     
     # Make modules load on boot
     echo "sit" > /etc/modules-load.d/sit.conf
@@ -73,24 +81,26 @@ function configure_firewall() {
     
     # Allow protocol 41 (IPv6 over IPv4)
     if command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p 41 -j ACCEPT
-        iptables -I FORWARD -p 41 -j ACCEPT
-        iptables -I OUTPUT -p 41 -j ACCEPT
+        iptables -I INPUT -p 41 -j ACCEPT >/dev/null 2>&1
+        iptables -I FORWARD -p 41 -j ACCEPT >/dev/null 2>&1
+        iptables -I OUTPUT -p 41 -j ACCEPT >/dev/null 2>&1
         
         # Save rules
         if command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
     fi
     
     # Allow IPv6 ICMP (for ping6)
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -I INPUT -p icmpv6 -j ACCEPT
-        ip6tables -I FORWARD -p icmpv6 -j ACCEPT
-        ip6tables -I OUTPUT -p icmpv6 -j ACCEPT
+        ip6tables -I INPUT -p icmpv6 -j ACCEPT >/dev/null 2>&1
+        ip6tables -I FORWARD -p icmpv6 -j ACCEPT >/dev/null 2>&1
+        ip6tables -I OUTPUT -p icmpv6 -j ACCEPT >/dev/null 2>&1
         
         # Save rules
         if command -v ip6tables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables
             ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
         fi
     fi
@@ -115,6 +125,7 @@ function configure_sysctl() {
     colored_msg blue "Configuring sysctl parameters..."
     
     # Create sysctl configuration file
+    mkdir -p /etc/sysctl.d
     cat > /etc/sysctl.d/99-ipv6-tunnel.conf <<EOF
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.default.forwarding=1
@@ -126,7 +137,7 @@ net.ipv4.ip_forward=1
 EOF
     
     # Apply settings
-    sysctl -p /etc/sysctl.d/99-ipv6-tunnel.conf
+    sysctl -p /etc/sysctl.d/99-ipv6-tunnel.conf >/dev/null 2>&1
 }
 
 # Create IPv6 tunnel
@@ -154,19 +165,19 @@ function create_tunnel() {
     load_modules
     
     # Remove any existing tunnel
-    ip link del ipv6tun 2>/dev/null
+    ip link del ipv6tun 2>/dev/null || true
     
     # Create tunnel interface
-    ip tunnel add ipv6tun mode sit remote $remote_ipv4 local $local_ipv4 ttl 255
+    ip tunnel add ipv6tun mode sit remote "$remote_ipv4" local "$local_ipv4" ttl 255
     
     # Set MTU to 1480 (standard for IPv6 in IPv4 tunnel)
     ip link set ipv6tun mtu 1480 up
     
     # Assign IPv6 addresses
-    ip addr add $local_ipv6 dev ipv6tun
+    ip addr add "$local_ipv6" dev ipv6tun
     
     # Add route for remote IPv6 through the tunnel
-    ip -6 route add $remote_ipv6 dev ipv6tun
+    ip -6 route add "$remote_ipv6" dev ipv6tun
     
     # Configure sysctl
     configure_sysctl
@@ -210,8 +221,10 @@ function create_network_config() {
         local remote_ipv4=$iran_ipv4
     fi
     
-    # Create network configuration file
-    cat > /etc/network/interfaces.d/ipv6tun <<EOF
+    # For Debian/Ubuntu systems
+    if [ -f /etc/debian_version ]; then
+        mkdir -p /etc/network/interfaces.d
+        cat > /etc/network/interfaces.d/ipv6tun <<EOF
 auto ipv6tun
 iface ipv6tun inet6 static
     address $local_ipv6
@@ -221,13 +234,30 @@ iface ipv6tun inet6 static
     tunnel-mode sit
     mtu 1480
 EOF
+    fi
+    
+    # For RHEL/CentOS/Fedora systems
+    if [ -f /etc/redhat-release ] || [ "$OS" == "fedora" ]; then
+        mkdir -p /etc/sysconfig/network-scripts
+        cat > /etc/sysconfig/network-scripts/ifcfg-ipv6tun <<EOF
+DEVICE=ipv6tun
+BOOTPROTO=none
+ONBOOT=yes
+IPV6INIT=yes
+IPV6ADDR=$local_ipv6
+TYPE=sit
+PEER_OUTER_IPV4ADDR=$remote_ipv4
+PEER_INNER_IPV4ADDR=$local_ipv4
+MTU=1480
+EOF
+    fi
     
     # For systems using NetworkManager
     if command -v nmcli >/dev/null 2>&1; then
-        nmcli con add type sit con-name ipv6tun ifname ipv6tun ip-tunnel.local $local_ipv4 ip-tunnel.remote $remote_ipv4
-        nmcli con mod ipv6tun ipv6.addresses $local_ipv6
-        nmcli con mod ipv6tun ipv6.method manual
-        nmcli con up ipv6tun
+        nmcli con add type sit con-name ipv6tun ifname ipv6tun ip-tunnel.local "$local_ipv4" ip-tunnel.remote "$remote_ipv4" >/dev/null 2>&1 || true
+        nmcli con mod ipv6tun ipv6.addresses "$local_ipv6" >/dev/null 2>&1 || true
+        nmcli con mod ipv6tun ipv6.method manual >/dev/null 2>&1 || true
+        nmcli con up ipv6tun >/dev/null 2>&1 || true
     fi
 }
 
@@ -250,12 +280,12 @@ function test_tunnel() {
         
         # Test ping
         colored_msg yellow "Pinging remote IPv6 address: $remote_ipv6"
-        if ping6 -c 3 -I ipv6tun $remote_ipv6 >/dev/null 2>&1; then
+        if ping6 -c 3 -I ipv6tun "$remote_ipv6" >/dev/null 2>&1; then
             colored_msg green "Ping successful! Tunnel is working."
             
             # Test with nc (netcat)
             colored_msg yellow "Testing with netcat..."
-            nc -6 -u -w 3 $remote_ipv6 50000 <<< "test" >/dev/null 2>&1
+            nc -6 -u -w 3 "$remote_ipv6" 50000 <<< "test" >/dev/null 2>&1
             if [ $? -eq 0 ]; then
                 colored_msg green "Netcat test successful!"
             else
@@ -295,7 +325,7 @@ function run_diagnostics() {
     
     # Check IPv4 connectivity
     colored_msg yellow "Testing IPv4 connectivity to remote server:"
-    if ping -c 3 $remote_ipv4 >/dev/null 2>&1; then
+    if ping -c 3 "$remote_ipv4" >/dev/null 2>&1; then
         colored_msg green "IPv4 connectivity to remote server is working."
     else
         colored_msg red "IPv4 connectivity to remote server is failing!"
@@ -303,7 +333,8 @@ function run_diagnostics() {
     
     # Check protocol 41
     colored_msg yellow "Checking if protocol 41 is allowed:"
-    if nc -4 -w 3 $remote_ipv4 41 <<< "test" >/dev/null 2>&1; then
+    nc -4 -w 3 "$remote_ipv4" 41 <<< "test" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
         colored_msg green "Protocol 41 is allowed."
     else
         colored_msg red "Protocol 41 may be blocked by firewall!"
@@ -322,10 +353,11 @@ function remove_tunnel() {
         colored_msg blue "Removing IPv6 tunnel..."
         
         # Remove tunnel interface
-        ip link del ipv6tun 2>/dev/null
+        ip link del ipv6tun 2>/dev/null || true
         
         # Remove network configuration
         rm -f /etc/network/interfaces.d/ipv6tun
+        rm -f /etc/sysconfig/network-scripts/ifcfg-ipv6tun
         
         # Remove NetworkManager connection
         if command -v nmcli >/dev/null 2>&1; then
@@ -381,7 +413,9 @@ function main_menu() {
                             location="foreign"
                             break
                             ;;
-                        *) echo "Invalid option";;
+                        *) 
+                            colored_msg red "Invalid option"
+                            ;;
                     esac
                 done
                 
@@ -389,6 +423,17 @@ function main_menu() {
                 colored_msg yellow "Please enter required information:"
                 read -p "Iran server IPv4: " iran_ipv4
                 read -p "Foreign server IPv4: " foreign_ipv4
+                
+                # Validate IPv4 addresses
+                if [[ ! "$iran_ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    colored_msg red "Invalid Iran IPv4 address format!"
+                    exit 1
+                fi
+                
+                if [[ ! "$foreign_ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    colored_msg red "Invalid Foreign IPv4 address format!"
+                    exit 1
+                fi
                 
                 echo ""
                 colored_msg blue "Creating IPv6 tunnel..."
@@ -408,7 +453,9 @@ function main_menu() {
             "Exit")
                 exit 0
                 ;;
-            *) echo "Invalid option";;
+            *) 
+                colored_msg red "Invalid option"
+                ;;
         esac
     done
 }
