@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Color message functions
 function colored_msg() {
     local color=$1
@@ -34,7 +33,6 @@ function check_os() {
         OS=$(uname -s | tr '[:upper:]' '[:lower:]')
         VER=$(uname -r)
     fi
-
     if [[ "$OS" != "ubuntu" && "$OS" != "debian" && "$OS" != "centos" && "$OS" != "fedora" ]]; then
         colored_msg red "This script only supports Debian/Ubuntu and RHEL/CentOS/Fedora systems."
         exit 1
@@ -50,6 +48,37 @@ function install_dependencies() {
         apt-get install -y iproute2 net-tools sed grep iputils-ping
     elif [ -f /etc/redhat-release ]; then
         yum install -y iproute net-tools sed grep iputils
+    fi
+}
+
+# Configure firewall for IPv6 tunnel
+function configure_firewall() {
+    colored_msg blue "Configuring firewall for IPv6 tunnel..."
+    
+    # Allow protocol 41 (IPv6 over IPv4)
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -I INPUT -p 41 -j ACCEPT
+        iptables -I FORWARD -p 41 -j ACCEPT
+    fi
+    
+    # Allow IPv6 ICMP (for ping6)
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -I INPUT -p icmpv6 -j ACCEPT
+        ip6tables -I FORWARD -p icmpv6 -j ACCEPT
+    fi
+    
+    # For systems with firewalld
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-protocol=41
+        firewall-cmd --permanent --add-protocol=ipv6-icmp
+        firewall-cmd --reload
+    fi
+    
+    # For systems with ufw
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow proto 41
+        ufw allow ipv6
+        ufw reload
     fi
 }
 
@@ -74,16 +103,32 @@ function create_tunnel() {
         local remote_ipv4=$iran_ipv4
     fi
     
+    # Remove any existing tunnel
+    ip link del ipv6tun 2>/dev/null
+    
     # Create tunnel interface
     ip tunnel add ipv6tun mode sit remote $remote_ipv4 local $local_ipv4 ttl 255
-    ip link set ipv6tun up
+    
+    # Set MTU to 1480 (standard for IPv6 in IPv4 tunnel)
+    ip link set ipv6tun mtu 1480 up
+    
+    # Assign IPv6 addresses with point-to-point configuration
     ip addr add $local_ipv6 dev ipv6tun
-    ip route add ::/0 dev ipv6tun
+    
+    # Add route for remote IPv6 through the tunnel
+    ip -6 route add $remote_ipv6 dev ipv6tun
     
     # Enable IPv6 forwarding
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-    echo 1 > /proc/sys/net/ipv6/conf/default/forwarding
-    echo 1 > /proc/sys/net/ipv6/conf/ipv6tun/forwarding
+    sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null
+    sysctl -w net.ipv6.conf.default.forwarding=1 > /dev/null
+    sysctl -w net.ipv6.conf.ipv6tun.forwarding=1 > /dev/null
+    
+    # Enable neighbor discovery
+    sysctl -w net.ipv6.conf.all.accept_ra=2 > /dev/null
+    sysctl -w net.ipv6.conf.default.accept_ra=2 > /dev/null
+    
+    # Configure firewall
+    configure_firewall
     
     # Save config for uninstall
     echo "$location $iran_ipv4 $foreign_ipv4" > /etc/ipv6tun.conf
@@ -96,6 +141,9 @@ function create_tunnel() {
     echo ""
     colored_msg yellow "To test connection, run this command on the remote server:"
     colored_msg blue "ping6 $remote_ipv6"
+    echo ""
+    colored_msg yellow "To test from this server:"
+    colored_msg blue "ping6 -I ipv6tun $remote_ipv6"
 }
 
 # Remove tunnel and revert changes
@@ -104,11 +152,11 @@ function remove_tunnel() {
         colored_msg blue "Removing IPv6 tunnel..."
         
         # Remove tunnel interface
-        ip link delete ipv6tun 2>/dev/null
+        ip link del ipv6tun 2>/dev/null
         
         # Disable IPv6 forwarding
-        echo 0 > /proc/sys/net/ipv6/conf/all/forwarding
-        echo 0 > /proc/sys/net/ipv6/conf/default/forwarding
+        sysctl -w net.ipv6.conf.all.forwarding=0 > /dev/null
+        sysctl -w net.ipv6.conf.default.forwarding=0 > /dev/null
         
         # Remove config file
         rm -f /etc/ipv6tun.conf
