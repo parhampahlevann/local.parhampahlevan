@@ -1,461 +1,326 @@
 #!/bin/bash
-# IPv6 Tunnel Script between Iran and Foreign Servers
-# Version: 2.0 - Fixed Version
+#
+# Backhule Premium Menu
+# 1) Install BBR Backhule Premium
+# 2) Uninstall BBR
+# 3) Install Wss Mux Backuhle Premium
+# 4) Uninstall Wss Mux
+# 5) Reboot server
+# 6) Exit
+#
 
-# Color message functions
-function colored_msg() {
-    local color=$1
-    local message=$2
-    case $color in
-        red) printf "\033[31m%s\033[0m\n" "$message" ;;
-        green) printf "\033[32m%s\033[0m\n" "$message" ;;
-        yellow) printf "\033[33m%s\033[0m\n" "$message" ;;
-        blue) printf "\033[34m%s\033[0m\n" "$message" ;;
-        *) printf "%s\n" "$message" ;;
-    esac
+set -o errexit
+set -o nounset
+set -o pipefail
+
+LOGFILE="/var/log/optimize.log"
+
+die() {
+  echo -e "\e[31m[ERROR]\e[0m $1" | tee -a "$LOGFILE"
+  exit 1
 }
 
-# Check root access
-function check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        colored_msg red "This script must be run as root. Use 'sudo $0'"
-        exit 1
-    fi
+log() {
+  echo -e "\e[32m[INFO]\e[0m $1" | tee -a "$LOGFILE"
 }
 
-# Detect OS
-function detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
-        VER=$VERSION_ID
-    elif [ -f /etc/redhat-release ]; then
-        OS=$(cat /etc/redhat-release | awk '{print tolower($1)}')
-        VER=$(cat /etc/redhat-release | sed 's/.*release \([0-9\.]\+\).*/\1/')
+# Ensure the script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+  die "This script must be run as root."
+fi
+
+# -----------------------------------------------------------
+# Shared: get default interface and auto /24 CIDR
+# -----------------------------------------------------------
+get_iface_and_cidr() {
+  local IFACE
+  IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}') || die "Cannot detect default interface."
+  local IP_ADDR
+  IP_ADDR=$(ip -4 addr show "$IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1) || die "Cannot read IP for interface $IFACE."
+  local BASE
+  BASE=$(echo "$IP_ADDR" | cut -d. -f1-3)
+  local CIDR="${BASE}.0/24"
+  echo "$IFACE" "$CIDR"
+}
+
+# -----------------------------------------------------------
+# 1) Install BBR Backhule Premium (original optimize script)
+# -----------------------------------------------------------
+
+declare -A sysctl_opts=(
+  # Queueing: prefer cake, fallback to fq_codel if unsupported
+  ["net.core.default_qdisc"]="cake"
+
+  # Congestion Control
+  ["net.ipv4.tcp_congestion_control"]="bbr"
+
+  # TCP Fast Open
+  ["net.ipv4.tcp_fastopen"]="3"
+
+  # MTU Probing
+  ["net.ipv4.tcp_mtu_probing"]="1"
+
+  # Window Scaling
+  ["net.ipv4.tcp_window_scaling"]="1"
+
+  # Backlog / SYN Queue
+  ["net.core.somaxconn"]="1024"
+  ["net.ipv4.tcp_max_syn_backlog"]="2048"
+  ["net.core.netdev_max_backlog"]="500000"
+
+  # Buffer sizes
+  ["net.core.rmem_default"]="262144"
+  ["net.core.rmem_max"]="134217728"
+  ["net.core.wmem_default"]="262144"
+  ["net.core.wmem_max"]="134217728"
+  ["net.ipv4.tcp_rmem"]="4096 87380 67108864"
+  ["net.ipv4.tcp_wmem"]="4096 65536 67108864"
+
+  # TIME-WAIT reuse
+  ["net.ipv4.tcp_tw_reuse"]="1"
+  # ["net.ipv4.tcp_tw_recycle"]="1"   # Disabled to avoid NAT issues
+
+  # FIN_TIMEOUT and Keepalive
+  ["net.ipv4.tcp_fin_timeout"]="15"
+  ["net.ipv4.tcp_keepalive_time"]="300"
+  ["net.ipv4.tcp_keepalive_intvl"]="30"
+  ["net.ipv4.tcp_keepalive_probes"]="5"
+
+  # TCP No Metrics Save
+  ["net.ipv4.tcp_no_metrics_save"]="1"
+)
+
+install_bbr_backhule_premium() {
+  log "Starting network tuning for low-latency and throughput..."
+
+  log "Applying sysctl settings..."
+  for key in "${!sysctl_opts[@]}"; do
+    value="${sysctl_opts[$key]}"
+
+    if sysctl -w "$key=$value" >/dev/null 2>&1; then
+      grep -qxF "$key = $value" /etc/sysctl.conf || echo "$key = $value" >> /etc/sysctl.conf
+      log "Applied and saved: $key = $value"
     else
-        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-        VER=$(uname -r)
+      if [[ "$key" == "net.core.default_qdisc" ]]; then
+        fallback="fq_codel"
+        sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "Cannot set $key to $fallback"
+        grep -qxF "$key = $fallback" /etc/sysctl.conf || echo "$key = $fallback" >> /etc/sysctl.conf
+        log "Fallback applied for $key: $fallback"
+      else
+        die "Failed to apply sysctl: $key=$value"
+      fi
     fi
+  done
 
-    if [[ "$OS" != "ubuntu" && "$OS" != "debian" && "$OS" != "centos" && "$OS" != "fedora" ]]; then
-        colored_msg red "Unsupported OS: $OS. Only Ubuntu, Debian, CentOS and Fedora are supported."
-        exit 1
-    fi
+  sysctl -p >/dev/null 2>&1 || die "Failed to reload sysctl"
+  log "All sysctl settings applied and saved."
+
+  log "Loading tcp_bbr module..."
+  if ! lsmod | grep -q '^tcp_bbr'; then
+    modprobe tcp_bbr || die "Failed to load tcp_bbr module"
+    echo "tcp_bbr" >/etc/modules-load.d/bbr.conf
+    log "tcp_bbr loaded and set for boot."
+  else
+    log "tcp_bbr module was already loaded."
+  fi
+
+  read IFACE CIDR < <(get_iface_and_cidr)
+  log "Default interface: $IFACE   Auto CIDR: $CIDR"
+
+  current_mtu=$(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')
+  if [ "$current_mtu" != "1420" ]; then
+    ip link set dev "$IFACE" mtu 1420 || die "Failed to set MTU to 1420 for $IFACE"
+    log "MTU set to 1420 for $IFACE"
+  else
+    log "MTU for $IFACE already set to 1420."
+  fi
+
+  if ! ip route show | grep -qw "$CIDR"; then
+    ip route add "$CIDR" dev "$IFACE" || die "Failed to add route $CIDR to $IFACE"
+    log "Route $CIDR added to interface $IFACE."
+  else
+    log "Route $CIDR already exists."
+  fi
+
+  log "Disabling NIC offloads on $IFACE..."
+  ethtool -K "$IFACE" gro off gso off tso off lro off \
+    && log "Offloads disabled." \
+    || log "Warning: NIC offloads not supported or already disabled."
+
+  log "Reducing interrupt coalescing on $IFACE..."
+  ethtool -C "$IFACE" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 \
+    && log "Interrupt coalescing configured for 1 interrupt per packet." \
+    || log "Warning: coalescing not supported or not configurable."
+
+  log "Assigning IRQ affinity for $IFACE to CPU core #1..."
+  for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
+    echo 2 > /proc/irq/"$irq"/smp_affinity \
+      && log "Assigned IRQ $irq to CPU core #1." \
+      || log "Warning: Failed to assign IRQ $irq to core #1."
+  done
+
+  log "All low-latency and throughput settings have been applied."
+  log "To verify:"
+  log "  • TCP Congestion Control:  sysctl net.ipv4.tcp_congestion_control"
+  log "  • MTU:                     ip link show $IFACE"
+  log "  • Route /24:               ip route show | grep \"$CIDR\""
+  log "  • Offloads:                ethtool -k $IFACE | grep -E 'gso|gro|tso|lro'"
+  log "  • Coalescing:              ethtool -c $IFACE"
+  log "  • IRQ affinity:            grep \"$IFACE\" /proc/interrupts"
+
+  echo -e "\n\e[34m>>> Settings applied. Now test with ping and iperf3.\e[0m\n"
 }
 
-# Install required packages
-function install_packages() {
-    colored_msg blue "Installing required packages..."
-    
-    # Update package lists
-    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-        apt-get update -qq
-        apt-get install -y -qq iproute2 net-tools sed grep iputils-ping curl netcat-openbsd
-    elif [ "$OS" = "centos" ] || [ "$OS" = "fedora" ]; then
-        if command -v dnf >/dev/null 2>&1; then
-            dnf install -y -q iproute net-tools sed grep iputils curl nmap-ncat
-        else
-            yum install -y -q iproute net-tools sed grep iputils curl nmap-ncat
-        fi
-    fi
-    
-    if [ $? -eq 0 ]; then
-        colored_msg green "Packages installed successfully."
-    else
-        colored_msg red "Failed to install packages."
-        exit 1
-    fi
+# -----------------------------------------------------------
+# 2) Uninstall BBR – revert settings as much as possible
+# -----------------------------------------------------------
+uninstall_bbr() {
+  log "Reverting BBR and network tuning settings (best effort)..."
+
+  for key in "${!sysctl_opts[@]}"; do
+    sed -i "/^$key = /d" /etc/sysctl.conf 2>/dev/null || true
+  done
+
+  sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1 || true
+  sysctl -p >/dev/null 2>&1 || log "Warning: failed to reload sysctl"
+
+  rm -f /etc/modules-load.d/bbr.conf
+  if lsmod | grep -q '^tcp_bbr'; then
+    modprobe -r tcp_bbr 2>/dev/null || log "Warning: could not unload tcp_bbr module"
+  fi
+
+  read IFACE CIDR < <(get_iface_and_cidr)
+  log "Default interface: $IFACE   Auto CIDR: $CIDR"
+
+  current_mtu=$(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')
+  if [ "$current_mtu" != "1500" ]; then
+    ip link set dev "$IFACE" mtu 1500 2>/dev/null || log "Warning: failed to reset MTU to 1500 for $IFACE"
+  fi
+
+  if ip route show | grep -qw "$CIDR"; then
+    ip route del "$CIDR" dev "$IFACE" 2>/dev/null || log "Warning: failed to delete route $CIDR"
+  fi
+
+  ethtool -K "$IFACE" gro on gso on tso on lro on 2>/dev/null || log "Warning: could not re-enable NIC offloads"
+  ethtool -C "$IFACE" rx-usecs 0 rx-frames 0 tx-usecs 0 tx-frames 0 2>/dev/null || log "Warning: could not reset interrupt coalescing"
+
+  local nproc mask
+  nproc=$(nproc 2>/dev/null || echo 1)
+  mask=$(printf "%x" $(( (1 << nproc) - 1 )))
+  for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
+    echo "$mask" > /proc/irq/"$irq"/smp_affinity 2>/dev/null || log "Warning: failed to reset IRQ $irq affinity"
+  done
+
+  log "Uninstall BBR & revert completed (best effort). A reboot is recommended."
 }
 
-# Load kernel modules
-function load_kernel_modules() {
-    colored_msg blue "Loading kernel modules..."
-    
-    modules=("sit" "tunnel4" "ip6_tunnel" "ip6_gre")
-    
-    for module in "${modules[@]}"; do
-        if ! lsmod | grep -q "$module"; then
-            modprobe "$module" 2>/dev/null
-            if [ $? -eq 0 ]; then
-                echo "$module" > "/etc/modules-load.d/${module}.conf"
-                colored_msg green "Module $module loaded."
-            else
-                colored_msg yellow "Warning: Failed to load module $module"
-            fi
-        fi
-    done
-}
+# -----------------------------------------------------------
+# 3) Install Wss Mux Backuhle Premium (write TOML configs)
+# -----------------------------------------------------------
+install_wss_mux_backuhle_premium() {
+  log "Installing Wss Mux Backuhle Premium configs..."
 
-# Configure firewall
-function setup_firewall() {
-    colored_msg blue "Configuring firewall..."
-    
-    # Allow protocol 41 (IPv6 over IPv4)
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p 41 -j ACCEPT 2>/dev/null
-        iptables -I FORWARD -p 41 -j ACCEPT 2>/dev/null
-        iptables -I OUTPUT -p 41 -j ACCEPT 2>/dev/null
-        
-        # Save rules
-        if command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
-    fi
-    
-    # Allow IPv6 ICMP
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -I INPUT -p icmpv6 -j ACCEPT 2>/dev/null
-        ip6tables -I FORWARD -p icmpv6 -j ACCEPT 2>/dev/null
-        ip6tables -I OUTPUT -p icmpv6 -j ACCEPT 2>/dev/null
-        
-        # Save rules
-        if command -v ip6tables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        fi
-    fi
-    
-    # For firewalld
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-protocol=41 >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-protocol=ipv6-icmp >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-    
-    # For UFW
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
-        ufw allow proto 41 >/dev/null 2>&1 || true
-        ufw allow ipv6 >/dev/null 2>&1 || true
-        ufw reload >/dev/null 2>&1 || true
-    fi
-    
-    colored_msg green "Firewall configured."
-}
-
-# Configure sysctl
-function setup_sysctl() {
-    colored_msg blue "Configuring sysctl parameters..."
-    
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-ipv6-tunnel.conf <<EOF
-net.ipv6.conf.all.forwarding=1
-net.ipv6.conf.default.forwarding=1
-net.ipv6.conf.all.disable_ipv6=0
-net.ipv6.conf.default.disable_ipv6=0
-net.ipv6.conf.all.accept_ra=2
-net.ipv6.conf.default.accept_ra=2
-net.ipv4.ip_forward=1
+  cat >/root/wssmux_server.toml <<'EOF'
+[server]
+bind_addr = "0.0.0.0:443"
+transport = "wssmux"
+token = "your_token" 
+keepalive_period = 75
+nodelay = true 
+heartbeat = 40 
+channel_size = 2048
+mux_con = 8
+mux_version = 1
+mux_framesize = 32768 
+mux_recievebuffer = 4194304
+mux_streambuffer = 65536 
+tls_cert = "/root/server.crt"      
+tls_key = "/root/server.key"
+sniffer = false 
+web_port = 2060
+sniffer_log = "/root/backhaul.json"
+log_level = "info"
+ports = []
 EOF
-    
-    sysctl -p /etc/sysctl.d/99-ipv6-tunnel.conf >/dev/null 2>&1
-    colored_msg green "Sysctl configured."
-}
 
-# Create tunnel
-function create_ipv6_tunnel() {
-    local location=$1
-    local iran_ipv4=$2
-    local foreign_ipv4=$3
-    
-    # Validate IPv4 addresses
-    if [[ ! "$iran_ipv4" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        colored_msg red "Invalid Iran IPv4 address format!"
-        exit 1
-    fi
-    
-    if [[ ! "$foreign_ipv4" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        colored_msg red "Invalid Foreign IPv4 address format!"
-        exit 1
-    fi
-    
-    # IPv6 prefix
-    local ipv6_prefix="fd00:1234:5678:9abc"
-    
-    if [ "$location" == "iran" ]; then
-        local local_ipv6="${ipv6_prefix}::1/64"
-        local remote_ipv6="${ipv6_prefix}::2"
-        local local_ipv4=$iran_ipv4
-        local remote_ipv4=$foreign_ipv4
-    else
-        local local_ipv6="${ipv6_prefix}::2/64"
-        local remote_ipv6="${ipv6_prefix}::1"
-        local local_ipv4=$foreign_ipv4
-        local remote_ipv4=$iran_ipv4
-    fi
-    
-    # Remove existing tunnel
-    ip link del ipv6tun 2>/dev/null || true
-    
-    # Create tunnel
-    ip tunnel add ipv6tun mode sit remote "$remote_ipv4" local "$local_ipv4" ttl 255
-    if [ $? -ne 0 ]; then
-        colored_msg red "Failed to create tunnel interface."
-        exit 1
-    fi
-    
-    # Configure tunnel
-    ip link set ipv6tun mtu 1480 up
-    ip addr add "$local_ipv6" dev ipv6tun
-    ip -6 route add "$remote_ipv6" dev ipv6tun
-    
-    # Save configuration
-    echo "$location $iran_ipv4 $foreign_ipv4" > /etc/ipv6tun.conf
-    
-    # Create persistent config
-    create_persistent_config "$location" "$iran_ipv4" "$foreign_ipv4"
-    
-    colored_msg green "IPv6 tunnel created successfully!"
-    echo ""
-    colored_msg yellow "Tunnel Information:"
-    echo "Local IPv6: $local_ipv6"
-    echo "Remote IPv6: $remote_ipv6"
-    echo ""
-    colored_msg yellow "Test command for remote server:"
-    colored_msg blue "ping6 -c 3 $remote_ipv6"
-}
-
-# Create persistent configuration
-function create_persistent_config() {
-    local location=$1
-    local iran_ipv4=$2
-    local foreign_ipv4=$3
-    
-    local ipv6_prefix="fd00:1234:5678:9abc"
-    
-    if [ "$location" == "iran" ]; then
-        local local_ipv6="${ipv6_prefix}::1/64"
-        local remote_ipv6="${ipv6_prefix}::2"
-        local local_ipv4=$iran_ipv4
-        local remote_ipv4=$foreign_ipv4
-    else
-        local local_ipv6="${ipv6_prefix}::2/64"
-        local remote_ipv6="${ipv6_prefix}::1"
-        local local_ipv4=$foreign_ipv4
-        local remote_ipv4=$iran_ipv4
-    fi
-    
-    # For Debian/Ubuntu
-    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-        mkdir -p /etc/network/interfaces.d
-        cat > /etc/network/interfaces.d/ipv6tun <<EOF
-auto ipv6tun
-iface ipv6tun inet6 static
-    address $local_ipv6
-    netmask 64
-    tunnel-ipv4-local $local_ipv4
-    tunnel-ipv4-remote $remote_ipv4
-    tunnel-mode sit
-    mtu 1480
+  cat >/root/wssmux_client.toml <<'EOF'
+[client]
+remote_addr = "0.0.0.0:443"
+edge_ip = "" 
+transport = "wssmux"
+token = "your_token" 
+keepalive_period = 75
+dial_timeout = 10
+nodelay = true
+retry_interval = 3
+connection_pool = 8
+aggressive_pool = false
+mux_version = 1
+mux_framesize = 32768 
+mux_recievebuffer = 4194304
+mux_streambuffer = 65536  
+sniffer = false 
+web_port = 2060
+sniffer_log = "/root/backhaul.json"
+log_level = "info"
 EOF
-    fi
-    
-    # For CentOS/RHEL/Fedora
-    if [ "$OS" = "centos" ] || [ "$OS" = "fedora" ]; then
-        mkdir -p /etc/sysconfig/network-scripts
-        cat > /etc/sysconfig/network-scripts/ifcfg-ipv6tun <<EOF
-DEVICE=ipv6tun
-BOOTPROTO=none
-ONBOOT=yes
-IPV6INIT=yes
-IPV6ADDR=$local_ipv6
-TYPE=sit
-PEER_OUTER_IPV4ADDR=$remote_ipv4
-PEER_INNER_IPV4ADDR=$local_ipv4
-MTU=1480
-EOF
-    fi
-    
-    # For NetworkManager
-    if command -v nmcli >/dev/null 2>&1; then
-        nmcli connection add type sit con-name ipv6tun ifname ipv6tun \
-            ip-tunnel.local "$local_ipv4" ip-tunnel.remote "$remote_ipv4" \
-            ipv6.addresses "$local_ipv6" ipv6.method manual >/dev/null 2>&1 || true
-        nmcli connection up ipv6tun >/dev/null 2>&1 || true
-    fi
+
+  log "Wss Mux Backuhle Premium configs created:"
+  log "  • /root/wssmux_server.toml"
+  log "  • /root/wssmux_client.toml"
+  echo -e "\n\e[34m>>> You can now point your WSS Mux binary to these TOML configs.\e[0m\n"
 }
 
-# Test tunnel
-function test_connection() {
-    if [ ! -f /etc/ipv6tun.conf ]; then
-        colored_msg yellow "No tunnel configuration found. Please create a tunnel first."
-        return 1
-    fi
-    
-    colored_msg blue "Testing IPv6 tunnel connection..."
-    
-    # Read config
-    local location=$(awk '{print $1}' /etc/ipv6tun.conf)
-    local iran_ipv4=$(awk '{print $2}' /etc/ipv6tun.conf)
-    local foreign_ipv4=$(awk '{print $3}' /etc/ipv6tun.conf)
-    
-    local ipv6_prefix="fd00:1234:5678:9abc"
-    if [ "$location" == "iran" ]; then
-        local remote_ipv6="${ipv6_prefix}::2"
-    else
-        local remote_ipv6="${ipv6_prefix}::1"
-    fi
-    
-    # Test with ping6
-    colored_msg yellow "Pinging $remote_ipv6..."
-    if ping6 -c 3 -W 2 "$remote_ipv6" >/dev/null 2>&1; then
-        colored_msg green "Ping successful! Tunnel is working."
-        return 0
-    else
-        colored_msg red "Ping failed. Running diagnostics..."
-        run_diagnostics "$remote_ipv6" "$remote_ipv4"
-        return 1
-    fi
+# -----------------------------------------------------------
+# 4) Uninstall Wss Mux – remove TOML configs
+# -----------------------------------------------------------
+uninstall_wss_mux() {
+  log "Uninstalling Wss Mux Backuhle Premium configs..."
+  rm -f /root/wssmux_server.toml /root/wssmux_client.toml
+  log "Configs removed (if they existed):"
+  log "  • /root/wssmux_server.toml"
+  log "  • /root/wssmux_client.toml"
 }
 
-# Diagnostics
-function run_diagnostics() {
-    local remote_ipv6=$1
-    local remote_ipv4=$2
-    
-    colored_msg yellow "=== DIAGNOSTICS ==="
-    
-    # Check tunnel interface
-    if ip link show ipv6tun >/dev/null 2>&1; then
-        colored_msg green "Tunnel interface exists:"
-        ip link show ipv6tun
-    else
-        colored_msg red "Tunnel interface does not exist!"
-    fi
-    
-    # Check IPv6 address
-    colored_msg yellow "IPv6 address on tunnel:"
-    ip -6 addr show dev ipv6tun 2>/dev/null || colored_msg red "No IPv6 address assigned!"
-    
-    # Check routes
-    colored_msg yellow "IPv6 routes:"
-    ip -6 route show | grep ipv6tun || colored_msg red "No route through tunnel!"
-    
-    # Check IPv4 connectivity
-    colored_msg yellow "Testing IPv4 connectivity to $remote_ipv4..."
-    if ping -c 3 -W 2 "$remote_ipv4" >/dev/null 2>&1; then
-        colored_msg green "IPv4 connectivity is working."
-    else
-        colored_msg red "IPv4 connectivity failed!"
-    fi
-    
-    # Check protocol 41
-    colored_msg yellow "Testing protocol 41..."
-    nc -4 -w 3 "$remote_ipv4" 41 <<< "test" >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        colored_msg green "Protocol 41 is allowed."
-    else
-        colored_msg red "Protocol 41 may be blocked!"
-    fi
-    
-    # Check kernel modules
-    colored_msg yellow "Checking kernel modules:"
-    lsmod | grep -E "(sit|tunnel4|ip6_tunnel)" || colored_msg red "Required modules not loaded!"
-    
-    colored_msg yellow "=== END DIAGNOSTICS ==="
-}
+# -----------------------------------------------------------
+# Menu
+# -----------------------------------------------------------
 
-# Remove tunnel
-function remove_ipv6_tunnel() {
-    if [ ! -f /etc/ipv6tun.conf ]; then
-        colored_msg yellow "No tunnel configuration found. Nothing to remove."
-        return 0
-    fi
-    
-    colored_msg blue "Removing IPv6 tunnel..."
-    
-    # Remove tunnel interface
-    ip link del ipv6tun 2>/dev/null || true
-    
-    # Remove configuration files
-    rm -f /etc/network/interfaces.d/ipv6tun
-    rm -f /etc/sysconfig/network-scripts/ifcfg-ipv6tun
-    rm -f /etc/ipv6tun.conf
-    
-    # Remove NetworkManager connection
-    if command -v nmcli >/dev/null 2>&1; then
-        nmcli connection delete ipv6tun 2>/dev/null || true
-    fi
-    
-    # Remove sysctl config
-    rm -f /etc/sysctl.d/99-ipv6-tunnel.conf
-    
-    # Remove module configs
-    rm -f /etc/modules-load.d/sit.conf
-    rm -f /etc/modules-load.d/tunnel4.conf
-    rm -f /etc/modules-load.d/ip6_tunnel.conf
-    rm -f /etc/modules-load.d/ip6_gre.conf
-    
-    colored_msg green "IPv6 tunnel removed successfully!"
-}
+while true; do
+  echo -e "\n\e[36m===== Backhule Premium Menu =====\e[0m"
+  echo "1) Install BBR Backhule Premium"
+  echo "2) Uninstall BBR"
+  echo "3) Install Wss Mux Backuhle Premium"
+  echo "4) Uninstall Wss Mux"
+  echo "5) Reboot server"
+  echo "6) Exit"
+  read -rp "Enter your choice [1-6]: " choice
 
-# Main menu
-function show_menu() {
-    while true; do
-        clear
-        colored_msg blue "===================================="
-        colored_msg blue "  IPv6 Tunnel Setup Tool v2.0"
-        colored_msg blue "===================================="
-        echo ""
-        echo "1) Create IPv6 Tunnel"
-        echo "2) Test Tunnel Connection"
-        echo "3) Remove IPv6 Tunnel"
-        echo "4) Exit"
-        echo ""
-        read -p "Select an option [1-4]: " choice
-        
-        case $choice in
-            1)
-                check_root
-                detect_os
-                install_packages
-                load_kernel_modules
-                setup_firewall
-                setup_sysctl
-                
-                echo ""
-                colored_msg yellow "Server Location:"
-                echo "1) Iran"
-                echo "2) Foreign"
-                read -p "Select location [1-2]: " loc_choice
-                
-                case $loc_choice in
-                    1) location="iran" ;;
-                    2) location="foreign" ;;
-                    *) 
-                        colored_msg red "Invalid selection!"
-                        continue
-                        ;;
-                esac
-                
-                echo ""
-                read -p "Enter Iran server IPv4: " iran_ipv4
-                read -p "Enter Foreign server IPv4: " foreign_ipv4
-                
-                create_ipv6_tunnel "$location" "$iran_ipv4" "$foreign_ipv4"
-                read -p "Press Enter to continue..."
-                ;;
-            2)
-                check_root
-                test_connection
-                read -p "Press Enter to continue..."
-                ;;
-            3)
-                check_root
-                remove_ipv6_tunnel
-                read -p "Press Enter to continue..."
-                ;;
-            4)
-                colored_msg green "Exiting..."
-                exit 0
-                ;;
-            *)
-                colored_msg red "Invalid option!"
-                sleep 2
-                ;;
-        esac
-    done
-}
-
-# Start script
-show_menu
+  case "$choice" in
+    1)
+      install_bbr_backhule_premium
+      ;;
+    2)
+      uninstall_bbr
+      ;;
+    3)
+      install_wss_mux_backuhle_premium
+      ;;
+    4)
+      uninstall_wss_mux
+      ;;
+    5)
+      log "Rebooting server..."
+      reboot
+      ;;
+    6)
+      echo "Exiting..."
+      exit 0
+      ;;
+    *)
+      echo "Invalid choice, please select 1–6."
+      ;;
+  esac
+done
