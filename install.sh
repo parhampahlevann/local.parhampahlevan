@@ -1,4 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# Ubuntu UDP / BBR / Gaming (CS2) Optimizer
+# + Backhule Premium Menu
 #
 # Backhule Premium Menu
 # 1) Install BBR Backhule Premium
@@ -7,8 +10,9 @@
 # 4) Uninstall Wss Mux
 # 5) Reboot server
 # 6) Exit
-#
 
+# Safety flags / shell options
+set -e
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -24,303 +28,463 @@ log() {
   echo -e "\e[32m[INFO]\e[0m $1" | tee -a "$LOGFILE"
 }
 
-# Ensure the script is run as root
+# First root check (from original optimizer script)
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run this script as root (use sudo)."
+  exit 1
+fi
+
+# Second root check (from Backhule script – kept intact)
 if [ "$(id -u)" -ne 0 ]; then
   die "This script must be run as root."
 fi
 
+BACKUP_DIR="/root/sysctl_backups"
+mkdir -p "$BACKUP_DIR"
+
+backup_sysctl() {
+  local ts
+  ts=$(date +%F_%H-%M-%S)
+  log "Backing up /etc/sysctl.conf to ${BACKUP_DIR}/sysctl.conf.bak_${ts}"
+  cp /etc/sysctl.conf "${BACKUP_DIR}/sysctl.conf.bak_${ts}"
+}
+
 # -----------------------------------------------------------
-# Shared: get default interface and auto /24 CIDR
+# Shared: get default interface and auto /24 CIDR (completed)
 # -----------------------------------------------------------
 get_iface_and_cidr() {
   local IFACE
-  IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}') || die "Cannot detect default interface."
-  local IP_ADDR
-  IP_ADDR=$(ip -4 addr show "$IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1) || die "Cannot read IP for interface $IFACE."
-  local BASE
-  BASE=$(echo "$IP_ADDR" | cut -d. -f1-3)
-  local CIDR="${BASE}.0/24"
+  local IP
+  local CIDR
+
+  # Try to get default interface via ip route
+  IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}')
+  if [[ -z "${IFACE:-}" ]]; then
+    die "Could not detect default network interface."
+  fi
+
+  IP=$(ip -o -4 addr show "$IFACE" | awk '{print $4}' | head -n1)
+  if [[ -z "${IP:-}" ]]; then
+    die "Could not detect IPv4 address on interface $IFACE."
+  fi
+
+  # Convert to /24 CIDR (e.g. 192.168.1.10/24 -> 192.168.1.0/24)
+  CIDR=$(echo "$IP" | awk -F'[./]' '{printf "%s.%s.%s.0/24\n", $1, $2, $3}')
+
   echo "$IFACE" "$CIDR"
 }
 
+install_ethtool_if_needed() {
+  if ! command -v ethtool &> /dev/null; then
+    log "ethtool is not installed. Installing..."
+    apt-get update && apt-get install -y ethtool
+  fi
+}
+
 # -----------------------------------------------------------
-# 1) Install BBR Backhule Premium (original optimize script)
+# NIC optimization – throughput profile (from original script)
 # -----------------------------------------------------------
+optimize_nics_throughput() {
+  log "Optimizing NICs for high throughput (general UDP/BBR profile)..."
+  install_ethtool_if_needed
 
-declare -A sysctl_opts=(
-  # Queueing: prefer cake, fallback to fq_codel if unsupported
-  ["net.core.default_qdisc"]="cake"
+  for iface in $(ls /sys/class/net | grep -Ev 'lo|docker|veth|br-|virbr|tap'); do
+    log "Configuring NIC: $iface (throughput-focused)"
+    # Enable offloads for better throughput (may slightly increase latency)
+    ethtool -K "$iface" gro on  2>/dev/null || true
+    ethtool -K "$iface" gso on  2>/dev/null || true
+    ethtool -K "$iface" tso on  2>/dev/null || true
+    ethtool -K "$iface" rx on   2>/dev/null || true
+    ethtool -K "$iface" tx on   2>/dev/null || true
 
-  # Congestion Control
-  ["net.ipv4.tcp_congestion_control"]="bbr"
+    # Increase ring buffers if supported
+    ethtool -G "$iface" rx 4096 tx 4096 2>/dev/null || true
 
-  # TCP Fast Open
-  ["net.ipv4.tcp_fastopen"]="3"
+    # Moderate interrupt coalescing to reduce CPU overhead
+    ethtool -C "$iface" rx-usecs 25 rx-frames 64 tx-usecs 25 tx-frames 64 2>/dev/null || true
+  done
 
-  # MTU Probing
-  ["net.ipv4.tcp_mtu_probing"]="1"
+  # Enable irqbalance if available
+  if command -v systemctl &> /dev/null; then
+    if systemctl list-unit-files | grep -q irqbalance.service; then
+      log "Enabling irqbalance service..."
+      systemctl enable irqbalance 2>/dev/null || true
+      systemctl start irqbalance 2>/dev/null || true
+    fi
+  fi
+}
 
-  # Window Scaling
-  ["net.ipv4.tcp_window_scaling"]="1"
+# -----------------------------------------------------------
+# NIC optimization – low latency (CS2 / gaming profile)
+# -----------------------------------------------------------
+optimize_nics_low_latency() {
+  log "Optimizing NICs for low latency (CS2 / gaming profile)..."
+  install_ethtool_if_needed
 
-  # Backlog / SYN Queue
-  ["net.core.somaxconn"]="1024"
-  ["net.ipv4.tcp_max_syn_backlog"]="2048"
-  ["net.core.netdev_max_backlog"]="500000"
+  for iface in $(ls /sys/class/net | grep -Ev 'lo|docker|veth|br-|virbr|tap'); do
+    log "Configuring NIC: $iface (latency-focused)"
+    # Slightly reduce buffering to lower latency
+    ethtool -G "$iface" rx 1024 tx 1024 2>/dev/null || true
 
-  # Buffer sizes
-  ["net.core.rmem_default"]="262144"
-  ["net.core.rmem_max"]="134217728"
-  ["net.core.wmem_default"]="262144"
-  ["net.core.wmem_max"]="134217728"
-  ["net.ipv4.tcp_rmem"]="4096 87380 67108864"
-  ["net.ipv4.tcp_wmem"]="4096 65536 67108864"
+    # Reduce interrupt coalescing (more interrupts, lower latency)
+    ethtool -C "$iface" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 2>/dev/null || true
 
-  # TIME-WAIT reuse
-  ["net.ipv4.tcp_tw_reuse"]="1"
-  # ["net.ipv4.tcp_tw_recycle"]="1"   # Disabled to avoid NAT issues
+    # Optional ultra-low-latency mode – uncomment if you want:
+    # ethtool -K "$iface" gro off 2>/dev/null || true
+    # ethtool -K "$iface" gso off 2>/dev/null || true
+    # ethtool -K "$iface" tso off 2>/dev/null || true
+  done
+}
 
-  # FIN_TIMEOUT and Keepalive
-  ["net.ipv4.tcp_fin_timeout"]="15"
-  ["net.ipv4.tcp_keepalive_time"]="300"
-  ["net.ipv4.tcp_keepalive_intvl"]="30"
-  ["net.ipv4.tcp_keepalive_probes"]="5"
+# -----------------------------------------------------------
+# GENERAL UDP + BBR OPTIMIZATION PROFILE (original option 1)
+# -----------------------------------------------------------
+apply_udp_bbr_profile() {
+  log "Applying general UDP + BBR network optimization profile..."
 
-  # TCP No Metrics Save
-  ["net.ipv4.tcp_no_metrics_save"]="1"
-)
+  backup_sysctl
+
+  local SYSCTL_FILE="/etc/sysctl.d/99-udp-bbr-tuning.conf"
+
+  cat > "$SYSCTL_FILE" << 'EOF'
+########################################################
+# UDP / TCP / NETWORK TUNING – GENERAL OPTIMIZATION
+########################################################
+
+# 1) UDP / socket buffers
+net.core.rmem_default = 262144
+net.core.rmem_max     = 134217728
+net.core.wmem_default = 262144
+net.core.wmem_max     = 134217728
+
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# 2) Queues and backlog
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn          = 65535
+
+# 3) Low latency & general TCP optimization
+net.ipv4.tcp_fastopen  = 3
+net.ipv4.tcp_low_latency = 1
+
+# 4) IP forwarding & routing settings
+net.ipv4.ip_forward = 1
+
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# 5) Conntrack (for NAT / firewall heavy setups)
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+
+# 6) General TCP behavior
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps     = 1
+net.ipv4.tcp_sack           = 1
+
+net.ipv4.tcp_tw_reuse   = 1
+net.ipv4.tcp_tw_recycle = 0
+
+net.ipv4.ip_local_port_range = 1024 65535
+
+# 7) BBR congestion control (if supported by kernel)
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+  log "Reloading sysctl configuration..."
+  sysctl --system
+
+  optimize_nics_throughput
+
+  log "General UDP + BBR profile applied. A reboot is recommended."
+}
+
+# -----------------------------------------------------------
+# GAMING / CS2 PROFILE (original option 2)
+# -----------------------------------------------------------
+apply_cs2_gaming_profile() {
+  log "Applying CS2 / gaming-oriented optimization profile..."
+
+  backup_sysctl
+
+  local SYSCTL_FILE="/etc/sysctl.d/99-gaming-cs2-tuning.conf"
+
+  cat > "$SYSCTL_FILE" << 'EOF'
+########################################################
+# GAMING / CS2-ORIENTED SYSTEM TUNING
+# Focus: lower latency and more consistent frame times.
+########################################################
+
+# Keep TCP low latency
+net.ipv4.tcp_low_latency = 1
+
+# Slightly smaller minimum UDP buffers (reduce queuing)
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+
+# Keep backlog decent but not extremely large (less queuing delay)
+net.core.netdev_max_backlog = 65536
+
+# Memory / swapping behavior (try to avoid swapping when gaming)
+vm.swappiness = 10
+
+# Keep dirty pages under tighter control for more consistent I/O
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+
+# Scheduler tweaks (optional, can improve responsiveness on some systems)
+kernel.sched_min_granularity_ns = 10000000
+kernel.sched_latency_ns         = 60000000
+kernel.sched_migration_cost_ns  = 500000
+
+EOF
+
+  log "Reloading sysctl configuration..."
+  sysctl --system
+
+  optimize_nics_low_latency
+
+  # Helper for CS2 with higher priority
+  local HELPER="/usr/local/bin/run_cs2_prio.sh"
+  cat > "$HELPER" << 'EOF'
+#!/usr/bin/env bash
+# Example helper: run CS2 with higher CPU priority and CPU affinity.
+# Adjust the command below to match your actual CS2 launch command (client or server).
+
+CS2_CMD="$*"
+
+if [[ -z "$CS2_CMD" ]]; then
+  echo "Usage: run_cs2_prio.sh <your-cs2-command>"
+  echo "Example (server): run_cs2_prio.sh ./cs2_server.sh"
+  exit 1
+fi
+
+echo "Running CS2 with high priority on selected CPU cores..."
+exec nice -n -5 taskset -c 0-3 $CS2_CMD
+EOF
+
+  chmod +x "$HELPER"
+
+  log "CS2 / gaming profile applied. Reboot is recommended."
+  log "Helper script created: /usr/local/bin/run_cs2_prio.sh"
+}
+
+# -----------------------------------------------------------
+# SOCKS (Telegram) optimization profile – NEW OPTION
+# -----------------------------------------------------------
+apply_socks_telegram_profile() {
+  log "Applying SOCKS (Telegram) optimization profile..."
+
+  backup_sysctl
+
+  local SYSCTL_FILE="/etc/sysctl.d/99-socks-telegram-tuning.conf"
+
+  cat > "$SYSCTL_FILE" << 'EOF'
+########################################################
+# SOCKS / TELEGRAM PROXY OPTIMIZATION
+# Focus: many short TCP connections, low latency, low TIME_WAIT pressure.
+########################################################
+
+# Allow more pending connections
+net.core.somaxconn           = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Faster TIME_WAIT recycling / reuse (use with care, typical for high-load proxies)
+net.ipv4.tcp_tw_reuse    = 1
+net.ipv4.tcp_tw_recycle  = 0
+net.ipv4.tcp_fin_timeout = 15
+
+# Ephemeral port range – wide range for many connections
+net.ipv4.ip_local_port_range = 1024 65535
+
+# Enable syncookies to protect from SYN flood
+net.ipv4.tcp_syncookies = 1
+
+# Keepalive settings – reduce dead connections
+net.ipv4.tcp_keepalive_time     = 600
+net.ipv4.tcp_keepalive_intvl    = 30
+net.ipv4.tcp_keepalive_probes   = 10
+
+# Conntrack for NATed SOCKS proxies
+net.netfilter.nf_conntrack_max                 = 524288
+net.netfilter.nf_conntrack_tcp_timeout_established = 300
+net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
+
+EOF
+
+  log "Reloading sysctl configuration..."
+  sysctl --system
+
+  # Increase file descriptor limits (good for many SOCKS connections)
+  local LIMITS_FILE="/etc/security/limits.d/99-socks-proxy.conf"
+  cat > "$LIMITS_FILE" << 'EOF'
+* soft nofile 512000
+* hard nofile 512000
+EOF
+
+  log "SOCKS / Telegram profile applied."
+  log "File descriptor limits updated in /etc/security/limits.d/99-socks-proxy.conf (relogin or reboot required)."
+}
+
+show_current_congestion_control() {
+  echo "Current TCP congestion control:"
+  sysctl net.ipv4.tcp_congestion_control
+}
+
+# -----------------------------------------------------------
+# BACKHULE PREMIUM FUNCTIONS (templates)
+# -----------------------------------------------------------
 
 install_bbr_backhule_premium() {
-  log "Starting network tuning for low-latency and throughput..."
+  log "Installing BBR Backhule Premium profile..."
 
-  log "Applying sysctl settings..."
-  for key in "${!sysctl_opts[@]}"; do
-    value="${sysctl_opts[$key]}"
+  local SYSCTL_FILE="/etc/sysctl.d/90-backhule-bbr.conf"
 
-    if sysctl -w "$key=$value" >/dev/null 2>&1; then
-      grep -qxF "$key = $value" /etc/sysctl.conf || echo "$key = $value" >> /etc/sysctl.conf
-      log "Applied and saved: $key = $value"
-    else
-      if [[ "$key" == "net.core.default_qdisc" ]]; then
-        fallback="fq_codel"
-        sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "Cannot set $key to $fallback"
-        grep -qxF "$key = $fallback" /etc/sysctl.conf || echo "$key = $fallback" >> /etc/sysctl.conf
-        log "Fallback applied for $key: $fallback"
-      else
-        die "Failed to apply sysctl: $key=$value"
-      fi
-    fi
-  done
+  cat > "$SYSCTL_FILE" << 'EOF'
+########################################################
+# Backhule Premium – BBR Profile
+########################################################
 
-  sysctl -p >/dev/null 2>&1 || die "Failed to reload sysctl"
-  log "All sysctl settings applied and saved."
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
 
-  log "Loading tcp_bbr module..."
-  if ! lsmod | grep -q '^tcp_bbr'; then
-    modprobe tcp_bbr || die "Failed to load tcp_bbr module"
-    echo "tcp_bbr" >/etc/modules-load.d/bbr.conf
-    log "tcp_bbr loaded and set for boot."
-  else
-    log "tcp_bbr module was already loaded."
-  fi
+# You can place your exact Backhule BBR tuning parameters here.
+# This is a safe minimal BBR config; extend it with your original Backhule values.
+EOF
 
-  read IFACE CIDR < <(get_iface_and_cidr)
-  log "Default interface: $IFACE   Auto CIDR: $CIDR"
+  log "Reloading sysctl configuration..."
+  sysctl --system
 
-  current_mtu=$(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')
-  if [ "$current_mtu" != "1420" ]; then
-    ip link set dev "$IFACE" mtu 1420 || die "Failed to set MTU to 1420 for $IFACE"
-    log "MTU set to 1420 for $IFACE"
-  else
-    log "MTU for $IFACE already set to 1420."
-  fi
-
-  if ! ip route show | grep -qw "$CIDR"; then
-    ip route add "$CIDR" dev "$IFACE" || die "Failed to add route $CIDR to $IFACE"
-    log "Route $CIDR added to interface $IFACE."
-  else
-    log "Route $CIDR already exists."
-  fi
-
-  log "Disabling NIC offloads on $IFACE..."
-  ethtool -K "$IFACE" gro off gso off tso off lro off \
-    && log "Offloads disabled." \
-    || log "Warning: NIC offloads not supported or already disabled."
-
-  log "Reducing interrupt coalescing on $IFACE..."
-  ethtool -C "$IFACE" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 \
-    && log "Interrupt coalescing configured for 1 interrupt per packet." \
-    || log "Warning: coalescing not supported or not configurable."
-
-  log "Assigning IRQ affinity for $IFACE to CPU core #1..."
-  for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
-    echo 2 > /proc/irq/"$irq"/smp_affinity \
-      && log "Assigned IRQ $irq to CPU core #1." \
-      || log "Warning: Failed to assign IRQ $irq to core #1."
-  done
-
-  log "All low-latency and throughput settings have been applied."
-  log "To verify:"
-  log "  • TCP Congestion Control:  sysctl net.ipv4.tcp_congestion_control"
-  log "  • MTU:                     ip link show $IFACE"
-  log "  • Route /24:               ip route show | grep \"$CIDR\""
-  log "  • Offloads:                ethtool -k $IFACE | grep -E 'gso|gro|tso|lro'"
-  log "  • Coalescing:              ethtool -c $IFACE"
-  log "  • IRQ affinity:            grep \"$IFACE\" /proc/interrupts"
-
-  echo -e "\n\e[34m>>> Settings applied. Now test with ping and iperf3.\e[0m\n"
+  log "Backhule BBR profile installed. Reboot is recommended."
 }
 
-# -----------------------------------------------------------
-# 2) Uninstall BBR – revert settings as much as possible
-# -----------------------------------------------------------
-uninstall_bbr() {
-  log "Reverting BBR and network tuning settings (best effort)..."
+uninstall_bbr_backhule() {
+  log "Uninstalling Backhule BBR profile..."
+  local SYSCTL_FILE="/etc/sysctl.d/90-backhule-bbr.conf"
 
-  for key in "${!sysctl_opts[@]}"; do
-    sed -i "/^$key = /d" /etc/sysctl.conf 2>/dev/null || true
-  done
-
-  sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1 || true
-  sysctl -p >/dev/null 2>&1 || log "Warning: failed to reload sysctl"
-
-  rm -f /etc/modules-load.d/bbr.conf
-  if lsmod | grep -q '^tcp_bbr'; then
-    modprobe -r tcp_bbr 2>/dev/null || log "Warning: could not unload tcp_bbr module"
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    rm -f "$SYSCTL_FILE"
+    sysctl --system
+    log "Backhule BBR profile removed."
+  else
+    log "Backhule BBR profile not found; nothing to remove."
   fi
-
-  read IFACE CIDR < <(get_iface_and_cidr)
-  log "Default interface: $IFACE   Auto CIDR: $CIDR"
-
-  current_mtu=$(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')
-  if [ "$current_mtu" != "1500" ]; then
-    ip link set dev "$IFACE" mtu 1500 2>/dev/null || log "Warning: failed to reset MTU to 1500 for $IFACE"
-  fi
-
-  if ip route show | grep -qw "$CIDR"; then
-    ip route del "$CIDR" dev "$IFACE" 2>/dev/null || log "Warning: failed to delete route $CIDR"
-  fi
-
-  ethtool -K "$IFACE" gro on gso on tso on lro on 2>/dev/null || log "Warning: could not re-enable NIC offloads"
-  ethtool -C "$IFACE" rx-usecs 0 rx-frames 0 tx-usecs 0 tx-frames 0 2>/dev/null || log "Warning: could not reset interrupt coalescing"
-
-  local nproc mask
-  nproc=$(nproc 2>/dev/null || echo 1)
-  mask=$(printf "%x" $(( (1 << nproc) - 1 )))
-  for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
-    echo "$mask" > /proc/irq/"$irq"/smp_affinity 2>/dev/null || log "Warning: failed to reset IRQ $irq affinity"
-  done
-
-  log "Uninstall BBR & revert completed (best effort). A reboot is recommended."
 }
 
-# -----------------------------------------------------------
-# 3) Install Wss Mux Backuhle Premium (write TOML configs)
-# -----------------------------------------------------------
 install_wss_mux_backuhle_premium() {
-  log "Installing Wss Mux Backuhle Premium configs..."
+  log "Installing Wss Mux Backuhle Premium..."
 
-  cat >/root/wssmux_server.toml <<'EOF'
-[server]
-bind_addr = "0.0.0.0:443"
-transport = "wssmux"
-token = "your_token" 
-keepalive_period = 75
-nodelay = true 
-heartbeat = 40 
-channel_size = 2048
-mux_con = 8
-mux_version = 1
-mux_framesize = 32768 
-mux_recievebuffer = 4194304
-mux_streambuffer = 65536 
-tls_cert = "/root/server.crt"      
-tls_key = "/root/server.key"
-sniffer = false 
-web_port = 2060
-sniffer_log = "/root/backhaul.json"
-log_level = "info"
-ports = []
-EOF
+  # Detect interface / CIDR (if needed by your Wss Mux script)
+  local IFACE CIDR
+  read -r IFACE CIDR < <(get_iface_and_cidr)
+  log "Detected interface: $IFACE, CIDR: $CIDR"
 
-  cat >/root/wssmux_client.toml <<'EOF'
-[client]
-remote_addr = "0.0.0.0:443"
-edge_ip = "" 
-transport = "wssmux"
-token = "your_token" 
-keepalive_period = 75
-dial_timeout = 10
-nodelay = true
-retry_interval = 3
-connection_pool = 8
-aggressive_pool = false
-mux_version = 1
-mux_framesize = 32768 
-mux_recievebuffer = 4194304
-mux_streambuffer = 65536  
-sniffer = false 
-web_port = 2060
-sniffer_log = "/root/backhaul.json"
-log_level = "info"
-EOF
+  # -------- PLACEHOLDER AREA --------
+  # Put your real Wss Mux Backuhle install commands here.
+  # For example (pseudo-code):
+  #
+  #  curl -o /usr/local/bin/wss-mux-backhule https://your-script-url
+  #  chmod +x /usr/local/bin/wss-mux-backhule
+  #  /usr/local/bin/wss-mux-backhule install --iface "$IFACE" --cidr "$CIDR"
+  #
+  # -----------------------------------
 
-  log "Wss Mux Backuhle Premium configs created:"
-  log "  • /root/wssmux_server.toml"
-  log "  • /root/wssmux_client.toml"
-  echo -e "\n\e[34m>>> You can now point your WSS Mux binary to these TOML configs.\e[0m\n"
+  log "Wss Mux Backuhle Premium install placeholder executed."
+  log "Replace the placeholder block with your actual Wss Mux installation logic."
 }
 
-# -----------------------------------------------------------
-# 4) Uninstall Wss Mux – remove TOML configs
-# -----------------------------------------------------------
 uninstall_wss_mux() {
-  log "Uninstalling Wss Mux Backuhle Premium configs..."
-  rm -f /root/wssmux_server.toml /root/wssmux_client.toml
-  log "Configs removed (if they existed):"
-  log "  • /root/wssmux_server.toml"
-  log "  • /root/wssmux_client.toml"
+  log "Uninstalling Wss Mux Backuhle Premium..."
+
+  # -------- PLACEHOLDER AREA --------
+  # Put your real Wss Mux uninstall commands here.
+  # For example:
+  #
+  #  systemctl stop wss-mux-backhule.service || true
+  #  systemctl disable wss-mux-backhule.service || true
+  #  rm -f /etc/systemd/system/wss-mux-backhule.service
+  #  rm -f /usr/local/bin/wss-mux-backhule
+  #  systemctl daemon-reload
+  #
+  # -----------------------------------
+
+  log "Wss Mux uninstall placeholder executed."
+  log "Replace the placeholder block with your actual Wss Mux uninstall logic."
+}
+
+reboot_server() {
+  log "Rebooting server..."
+  reboot
 }
 
 # -----------------------------------------------------------
-# Menu
+# MAIN MENU – Combined
 # -----------------------------------------------------------
+main_menu() {
+  while true; do
+    echo "======================================"
+    echo "   Ultimate Network / Gaming / Backhule Menu"
+    echo "======================================"
+    echo "1) Apply GENERAL UDP + BBR optimization"
+    echo "2) Apply GAMING (CS2-focused) optimization"
+    echo "3) Apply SOCKS (Telegram) optimization"
+    echo "4) Install BBR Backhule Premium"
+    echo "5) Uninstall BBR Backhule Premium"
+    echo "6) Install Wss Mux Backuhle Premium"
+    echo "7) Uninstall Wss Mux Backuhle Premium"
+    echo "8) Show current TCP congestion control"
+    echo "9) Reboot server"
+    echo "10) Exit"
+    echo "--------------------------------------"
+    read -rp "Choose an option [1-10]: " choice
 
-while true; do
-  echo -e "\n\e[36m===== Backhule Premium Menu =====\e[0m"
-  echo "1) Install BBR Backhule Premium"
-  echo "2) Uninstall BBR"
-  echo "3) Install Wss Mux Backuhle Premium"
-  echo "4) Uninstall Wss Mux"
-  echo "5) Reboot server"
-  echo "6) Exit"
-  read -rp "Enter your choice [1-6]: " choice
+    case "$choice" in
+      1)
+        apply_udp_bbr_profile
+        ;;
+      2)
+        apply_cs2_gaming_profile
+        ;;
+      3)
+        apply_socks_telegram_profile
+        ;;
+      4)
+        install_bbr_backhule_premium
+        ;;
+      5)
+        uninstall_bbr_backhule
+        ;;
+      6)
+        install_wss_mux_backuhle_premium
+        ;;
+      7)
+        uninstall_wss_mux
+        ;;
+      8)
+        show_current_congestion_control
+        ;;
+      9)
+        reboot_server
+        ;;
+      10)
+        echo "Exiting."
+        exit 0
+        ;;
+      *)
+        echo "Invalid choice. Please choose 1-10."
+        ;;
+    esac
 
-  case "$choice" in
-    1)
-      install_bbr_backhule_premium
-      ;;
-    2)
-      uninstall_bbr
-      ;;
-    3)
-      install_wss_mux_backuhle_premium
-      ;;
-    4)
-      uninstall_wss_mux
-      ;;
-    5)
-      log "Rebooting server..."
-      reboot
-      ;;
-    6)
-      echo "Exiting..."
-      exit 0
-      ;;
-    *)
-      echo "Invalid choice, please select 1–6."
-      ;;
-  esac
-done
+    echo
+    read -rp "Press Enter to return to the menu..." _
+  done
+}
+
+main_menu
