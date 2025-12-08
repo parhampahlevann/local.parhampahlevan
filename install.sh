@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Simple Cloudflare WARP Menu (Parham Edition)
-# Works on Ubuntu 24 (noble mapped to jammy)
-# Modes:
-#  - Proxy mode: SOCKS5 127.0.0.1:10808
-#  - Full system mode: all server traffic via WARP (warp)
+# Simple Cloudflare WARP Menu (Safe Proxy-Only Edition)
+# Author: Parham
+# - Ubuntu 24 (noble -> jammy)
+# - ONLY proxy mode (SOCKS5 127.0.0.1:10808)
+# - No full-tunnel "warp" mode (to avoid breaking VPS connectivity)
 
 # ================= Auto-install on first run =================
 SCRIPT_PATH="/usr/local/bin/warp-menu"
@@ -26,7 +26,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
-VERSION="3.0-parham-ubuntu24-warp-full"
+VERSION="3.1-parham-safe-proxy"
 
 # ================= Root check =================
 if [[ $EUID -ne 0 ]]; then
@@ -69,7 +69,7 @@ EOF
   fi
 }
 
-# ================= Helpers: IP detection =================
+# ================= Helpers: IP detection via SOCKS5 =================
 warp_get_out_ip4() {
   local proxy_ip="127.0.0.1"
   local proxy_port="10808"
@@ -135,6 +135,36 @@ warp_set_custom_endpoint() {
   sleep 1
 }
 
+# ================= Safe Proxy Mode (repair / enforce) =================
+warp_enable_proxy_mode() {
+  echo -e "${CYAN}Switching WARP to SAFE PROXY mode (SOCKS5 127.0.0.1:10808)...${NC}"
+
+  if ! warp_is_installed; then
+    echo -e "${RED}WARP is not installed. Use Install first.${NC}"
+    return 1
+  fi
+
+  warp-cli disconnect 2>/dev/null || true
+  sleep 1
+
+  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
+  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808 2>/dev/null || true
+
+  warp-cli connect
+  sleep 3
+
+  if warp_is_connected; then
+    echo -e "${GREEN}WARP is now in PROXY mode (SOCKS5 127.0.0.1:10808).${NC}"
+  else
+    echo -e "${RED}Failed to enable PROXY mode.${NC}"
+  fi
+}
+
+warp_show_mode() {
+  echo -e "${CYAN}Current WARP settings:${NC}"
+  warp-cli settings 2>/dev/null || echo -e "${RED}warp-cli settings failed${NC}"
+}
+
 # ================= Core: install =================
 warp_install() {
   if warp_is_installed && warp_is_connected; then
@@ -170,14 +200,15 @@ warp_install() {
 
 # ================= Core: initial connect (proxy mode + Germany) =================
 warp_connect_initial() {
-  echo -e "${BLUE}Initial WARP setup...${NC}"
+  echo -e "${BLUE}Initial WARP setup (proxy mode, Germany)...${NC}"
 
   yes | warp-cli registration new 2>/dev/null || \
   warp-cli registration new 2>/dev/null || \
   warp-cli register 2>/dev/null
 
-  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
-  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
+  # Safe proxy mode
+  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
+  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808 2>/dev/null || true
 
   # default endpoint: Germany
   warp_set_custom_endpoint "188.114.98.10:2408"
@@ -239,7 +270,7 @@ warp_status() {
   echo
 
   if warp_is_connected; then
-    echo -e "${CYAN}=== Proxy and IP Info (if in proxy mode) ===${NC}"
+    echo -e "${CYAN}=== Proxy and IP Info (proxy mode) ===${NC}"
     local ip4 ip6
     ip4=$(warp_get_out_ip4)
     ip6=$(warp_get_out_ip6)
@@ -247,7 +278,7 @@ warp_status() {
     if [[ -n "$ip4" ]]; then
       echo -e "  IPv4 via WARP SOCKS5 (127.0.0.1:10808): ${GREEN}$ip4${NC}"
     else
-      echo -e "  ${YELLOW}IPv4 via SOCKS5: N/A (maybe in full system mode)${NC}"
+      echo -e "  ${YELLOW}IPv4 via SOCKS5: N/A (check proxy mode)${NC}"
     fi
 
     if [[ -n "$ip6" ]]; then
@@ -409,7 +440,7 @@ warp_apply_endpoint() {
   warp_disconnect
   warp_set_custom_endpoint "$addr"
   echo "${name}|${addr}" > "$CURRENT_ENDPOINT_FILE"
-  warp_connect
+  warp_enable_proxy_mode
   warp_status
 }
 
@@ -437,60 +468,6 @@ warp_multiloc_menu() {
   done
 }
 
-# ================= New: FULL system WARP / Proxy mode =================
-warp_enable_system_warp() {
-  echo -e "${CYAN}Switching WARP to FULL system mode (warp)...${NC}"
-
-  if ! warp_is_installed; then
-    echo -e "${RED}WARP is not installed. Use Install first.${NC}"
-    return 1
-  fi
-
-  warp_disconnect
-  sleep 1
-
-  warp-cli set-mode warp 2>/dev/null || warp-cli mode warp 2>/dev/null || true
-
-  warp-cli connect
-  sleep 3
-
-  if warp_is_connected; then
-    echo -e "${GREEN}WARP is now in FULL system mode.${NC}"
-    echo "All server traffic (including x-ui / v2ray) goes through WARP."
-  else
-    echo -e "${RED}Failed to enable FULL system mode.${NC}"
-  fi
-}
-
-warp_enable_proxy_mode() {
-  echo -e "${CYAN}Switching WARP to PROXY mode (SOCKS5 127.0.0.1:10808)...${NC}"
-
-  if ! warp_is_installed; then
-    echo -e "${RED}WARP is not installed. Use Install first.${NC}"
-    return 1
-  fi
-
-  warp_disconnect
-  sleep 1
-
-  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
-  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808 2>/dev/null || true
-
-  warp-cli connect
-  sleep 3
-
-  if warp_is_connected; then
-    echo -e "${GREEN}WARP is now in PROXY mode (SOCKS5 127.0.0.1:10808).${NC}"
-  else
-    echo -e "${RED}Failed to enable PROXY mode.${NC}"
-  fi
-}
-
-warp_show_mode() {
-  echo -e "${CYAN}Current WARP settings:${NC}"
-  warp-cli settings 2>/dev/null || echo -e "${RED}warp-cli settings failed${NC}"
-}
-
 # ================= Menu =================
 warp_draw_menu() {
   clear
@@ -513,7 +490,7 @@ warp_draw_menu() {
   echo "               WARP Manager v${VERSION}"
   echo "======================================================="
   echo -e " Status : ${status_color}${status}${NC}"
-  echo -e " SOCKS5 : 127.0.0.1:10808 (proxy mode)"
+  echo -e " SOCKS5 : 127.0.0.1:10808 (proxy mode only)"
   echo -e " IPv4   : ${YELLOW}${ip4}${NC}"
   echo "-------------------------------------------------------"
   echo " 1) Install WARP"
@@ -523,9 +500,8 @@ warp_draw_menu() {
   echo " 5) Quick IP Change"
   echo " 6) New Identity (re-register)"
   echo " 7) Multi-location (Germany/NL/...)"
-  echo " 8) Enable FULL system WARP (all server traffic via WARP)"
-  echo " 9) Enable PROXY mode (SOCKS5 127.0.0.1:10808)"
-  echo "10) Show WARP settings/mode"
+  echo " 8) Re-apply SAFE proxy mode (repair)"
+  echo " 9) Show WARP settings/mode"
   echo " 0) Exit"
   echo "-------------------------------------------------------"
   echo -ne "${YELLOW}Select option: ${NC}"
@@ -545,9 +521,8 @@ warp_main_menu() {
       5) warp_quick_change_ip ;;
       6) warp_new_identity ;;
       7) warp_multiloc_menu ;;
-      8) warp_enable_system_warp ;;
-      9) warp_enable_proxy_mode ;;
-      10) warp_show_mode ;;
+      8) warp_enable_proxy_mode ;;
+      9) warp_show_mode ;;
       0) echo -e "${GREEN}Bye.${NC}"; exit 0 ;;
       *) echo -e "${RED}Invalid choice.${NC}" ;;
     esac
