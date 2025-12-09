@@ -2,112 +2,167 @@
 
 set -e
 
-if [[ $EUID -ne 0 ]]; then
-  echo "[*] Running as root required. Re-running with sudo..."
-  exec sudo -E bash "$0" "$@"
-fi
-
-SCRIPT_PATH="/usr/local/bin/warp-menu"
-CURRENT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-
-if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" && -f "$CURRENT_PATH" ]]; then
-  echo "[*] Installing warp-menu to $SCRIPT_PATH ..."
-  cp "$CURRENT_PATH" "$SCRIPT_PATH"
-  chmod +x "$SCRIPT_PATH"
-  echo "[OK] Installed. Use: warp-menu"
-fi
-
-### Colors
+# Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
-YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-have_cmd() { command -v "$1" &>/dev/null; }
+WARP_DIR="/opt/warp-go"
+WG_CONF="/etc/wireguard/warp.conf"
+WG_IF="wgwarp"
 
-### Install CFwarp
-install_cfwarp() {
-  if have_cmd cf; then
-    echo "[OK] CFwarp already installed."
-    return
-  fi
+echo_info() { echo -e "${CYAN}[*]${NC} $1"; }
+echo_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+echo_err()  { echo -e "${RED}[ERR]${NC} $1"; }
 
-  echo "[*] Installing CFwarp (warp-yg: yonggekkk)..."
-  curl -sSL -o /usr/bin/cf -L https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh
-  chmod +x /usr/bin/cf
-
-  if have_cmd cf; then
-    echo "[OK] CFwarp installed."
-  else
-    echo "[ERR] Failed to install CFwarp."
+check_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo_err "Please run as root."
     exit 1
   fi
 }
 
-### Auto-enable WARP IPv4 FULL MODE
-enable_ipv4_warp() {
-  install_cfwarp
+install_dependencies() {
+  apt update -y
+  apt install -y curl wireguard wireguard-tools resolvconf
+}
 
-  echo "[*] Activating WARP IPv4 FULL tunnel (English mode)..."
-  echo "[*] Running: cf i"
-  sleep 1
+install_warp() {
+  check_root
 
-  # This is the CFwarp internal command for IPv4-only Warp
-  cf i
+  echo_info "Installing warp-go (WARP engine)..."
 
-  echo "[*] Checking outbound IP..."
-  sleep 3
+  mkdir -p "$WARP_DIR"
+  cd "$WARP_DIR"
 
-  NEW_IP=$(curl -4 -s https://ipv4.icanhazip.com || true)
+  curl -sLO https://gitlab.com/ProjectWARP/warp-go/-/raw/main/warp-go
+  chmod +x warp-go
 
-  if [[ -n "$NEW_IP" ]]; then
-    echo -e "[OK] New IPv4 WARP IP: ${GREEN}${NEW_IP}${NC}"
+  echo_info "Registering WARP identity..."
+  ./warp-go --register >/tmp/warp-temp.json 2>/dev/null || true
+
+  if [[ ! -f /tmp/warp-temp.json ]]; then
+    echo_err "Registration failed."
+    exit 1
+  fi
+
+  echo_info "Generating Warp WireGuard config..."
+
+  ./warp-go --export-wireguard >/etc/wireguard/warp.conf
+  chmod 600 /etc/wireguard/warp.conf
+
+  echo_ok "WARP installed successfully."
+}
+
+enable_warp_ipv4() {
+  check_root
+
+  if [[ ! -f "$WG_CONF" ]]; then
+    echo_err "WARP is not installed. Install first."
+    exit 1
+  fi
+
+  echo_info "Enabling WARP IPv4 FULL Tunnel..."
+
+  wg-quick down "$WG_IF" 2>/dev/null || true
+  cp "$WG_CONF" "/etc/wireguard/${WG_IF}.conf"
+
+  wg-quick up "$WG_IF"
+
+  # Set default route over warp
+  ip -4 route replace default dev "$WG_IF"
+
+  echo_ok "WARP IPv4 FULL Tunnel is now active."
+
+  echo_info "Checking outbound IPv4..."
+  IP=$(curl -4 -s https://ipv4.icanhazip.com || true)
+
+  if [[ -n "$IP" ]]; then
+    echo_ok "Your WARP IPv4: $IP"
   else
-    echo -e "[ERR] Unable to fetch IPv4 after activating WARP."
+    echo_err "Could not fetch IPv4 – check connection."
   fi
 }
 
-### Disable warp-go
-disable_ipv4_warp() {
-  if ! have_cmd cf; then
-    echo "[ERR] CFwarp not installed."
-    return
-  fi
+disable_warp() {
+  check_root
+  echo_info "Disabling WARP..."
+  wg-quick down "$WG_IF" 2>/dev/null || true
 
-  echo "[*] Disabling WARP IPv4..."
-  cf x
+  echo_info "Restoring default routing..."
+  dhclient -4 -r 2>/dev/null || true
+  dhclient -4 2>/dev/null || true
 
-  echo "[*] Checking outbound IP..."
-  sleep 2
-  curl -4 https://ipv4.icanhazip.com
+  echo_ok "WARP disabled."
 }
 
-### Main menu
+show_status() {
+  echo_info "Checking WARP interface..."
+
+  if ip a | grep -q "$WG_IF"; then
+    echo_ok "WARP interface is active: $WG_IF"
+  else
+    echo_err "WARP interface is NOT active."
+  fi
+
+  echo_info "Checking outbound IPv4..."
+  IP=$(curl -4 -s https://ipv4.icanhazip.com || true)
+
+  if [[ -n "$IP" ]]; then
+    echo_ok "Outbound IPv4 = $IP"
+  else
+    echo_err "Cannot reach IPv4."
+  fi
+}
+
+uninstall_warp() {
+  check_root
+
+  echo_info "Stopping WARP..."
+  wg-quick down "$WG_IF" 2>/dev/null || true
+
+  echo_info "Removing warp-go & configs..."
+  rm -rf "$WARP_DIR"
+  rm -rf /etc/wireguard/warp.conf
+  rm -rf /etc/wireguard/${WG_IF}.conf
+
+  echo_info "Restoring routing..."
+  dhclient -4 -r 2>/dev/null || true
+  dhclient -4 2>/dev/null || true
+
+  echo_ok "WARP fully removed. System is restored."
+}
+
 menu() {
   clear
   echo "=============================================="
-  echo " Cloudflare WARP Manager (English Edition)"
+  echo "   Cloudflare WARP Manager (English Edition)"
   echo "=============================================="
-  echo " 1) Enable WARP IPv4 FULL Tunnel (Auto-English)"
-  echo " 2) Disable WARP IPv4"
-  echo " 3) Open CFwarp original menu (Chinese)"
+  echo " 1) Install WARP (warp-go engine)"
+  echo " 2) Enable WARP IPv4 FULL tunnel"
+  echo " 3) Disable WARP"
+  echo " 4) Show WARP status"
+  echo " 5) Uninstall WARP completely"
   echo " 0) Exit"
   echo
 }
 
+check_root
+
 while true; do
   menu
-  read -rp "Choose: " c
+  read -rp "Choose an option: " c
 
   case "$c" in
-    1) enable_ipv4_warp ;;
-    2) disable_ipv4_warp ;;
-    3) install_cfwarp; cf ;;
+    1) install_dependencies; install_warp ;;
+    2) enable_warp_ipv4 ;;
+    3) disable_warp ;;
+    4) show_status ;;
+    5) uninstall_warp ;;
     0) exit 0 ;;
-    *) echo "[ERR] Invalid option" ;;
+    *) echo_err "Invalid option." ;;
   esac
 
-  echo
   read -rp "Press ENTER to continue..."
 done
