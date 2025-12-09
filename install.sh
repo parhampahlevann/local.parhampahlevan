@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Cloudflare WARP IPv4 Manager (Ubuntu 20/22/24)
-# Uses wgcf + wireguard, with full uninstall option
+# Uses wgcf + WireGuard, includes robust install, status, disable and full uninstall.
+# English-only menu. Handles "existing account detected" gracefully.
 
-# مهم: عمداً set -e نذاشتم تا همه‌چیز با اولین خطا کرش نکنه.
+# (Intentionally no 'set -e' to avoid exiting on first non-zero return.)
 
 # ===== Colors & helpers =====
 GREEN='\033[0;32m'
@@ -37,12 +38,12 @@ mkdir -p "$MANAGER_DIR"
 # ===== Install dependencies =====
 install_deps() {
   echo_info "Installing dependencies (wireguard, curl, wget, resolvconf)..."
-  apt update -y >/dev/null 2>&1
-  apt install -y wireguard wireguard-tools resolvconf curl wget >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools resolvconf curl wget >/dev/null 2>&1
   echo_ok "Dependencies installed."
 }
 
-# ===== Install wgcf via CFwarp mirror (پایدار) =====
+# ===== Install wgcf via stable mirror =====
 install_wgcf() {
   if [[ -x "$WGCF_BIN" ]]; then
     echo_ok "wgcf already installed at $WGCF_BIN"
@@ -57,19 +58,15 @@ install_wgcf() {
   url_base="https://raw.githubusercontent.com/cf-dm/CFwarp/main"
 
   case "$arch" in
-    x86_64)
-      fname="wgcf_2.2.22_amd64"
-      ;;
-    aarch64|arm64)
-      fname="wgcf_2.2.22_arm64"
-      ;;
+    x86_64)           fname="wgcf_2.2.22_amd64" ;;
+    aarch64|arm64)    fname="wgcf_2.2.22_arm64" ;;
     *)
       echo_err "Unsupported architecture: $arch"
       exit 1
       ;;
   esac
 
-  echo_info "Downloading wgcf ($fname) from CFwarp repo..."
+  echo_info "Downloading wgcf ($fname) from CFwarp mirror..."
   curl -fsSL -o "$WGCF_BIN" "${url_base}/${fname}"
   if [[ $? -ne 0 ]]; then
     echo_err "Failed to download wgcf from ${url_base}/${fname}"
@@ -78,31 +75,42 @@ install_wgcf() {
   fi
   chmod +x "$WGCF_BIN"
 
-  # تست سریع
   "$WGCF_BIN" -h >/dev/null 2>&1
   if [[ $? -ne 0 ]]; then
     echo_err "wgcf binary seems invalid or not executable."
     exit 1
   fi
-
   echo_ok "wgcf installed successfully at $WGCF_BIN"
 }
 
-# ===== Generate wgcf config for IPv4 FULL tunnel =====
+# ===== Generate wgcf config for IPv4 FULL tunnel (handles existing account) =====
 generate_wgcf_config() {
   install_wgcf
   mkdir -p "$WG_DIR"
 
+  # If account file not in /etc/wireguard but exists in current dir, adopt it.
+  if [[ ! -f "$WGCF_ACCOUNT" && -f wgcf-account.toml ]]; then
+    echo_info "Found existing wgcf-account.toml in current directory. Using it."
+    mv wgcf-account.toml "$WGCF_ACCOUNT"
+  fi
+
   if [[ ! -f "$WGCF_ACCOUNT" ]]; then
     echo_info "Registering new WARP account with wgcf..."
-    # از --accept-tos استفاده می‌کنیم تا مشکل yes/No حل شود
     "$WGCF_BIN" register --accept-tos
-    if [[ $? -ne 0 ]]; then
-      echo_err "wgcf register failed. Cloudflare might be blocking this IP."
-      exit 1
+    reg_exit=$?
+
+    # If register created local file, move it to /etc/wireguard
+    [[ -f wgcf-account.toml && ! -f "$WGCF_ACCOUNT" ]] && mv wgcf-account.toml "$WGCF_ACCOUNT"
+
+    if [[ $reg_exit -ne 0 ]]; then
+      if [[ -f "$WGCF_ACCOUNT" ]]; then
+        echo_warn "wgcf register returned non-zero, but existing account detected. Continuing..."
+      else
+        echo_err "wgcf register failed and no account file was created."
+        exit 1
+      fi
     fi
-    [[ -f wgcf-account.toml ]] && mv wgcf-account.toml "$WGCF_ACCOUNT"
-    echo_ok "Account file saved to $WGCF_ACCOUNT"
+    echo_ok "Account file ready at $WGCF_ACCOUNT"
   else
     echo_info "Using existing WARP account: $WGCF_ACCOUNT"
   fi
@@ -110,8 +118,10 @@ generate_wgcf_config() {
   echo_info "Generating wgcf WARP profile..."
   rm -f wgcf-profile.conf 2>/dev/null || true
   "$WGCF_BIN" generate
-  if [[ $? -ne 0 ]]; then
-    echo_err "wgcf generate failed."
+  gen_exit=$?
+
+  if [[ $gen_exit -ne 0 ]]; then
+    echo_err "wgcf generate failed (exit code $gen_exit)."
     exit 1
   fi
 
@@ -137,7 +147,7 @@ generate_wgcf_config() {
   echo_ok "WARP wgcf config created at $WGCF_CONF (IPv4 only)."
 }
 
-# ===== Save original default route =====
+# ===== Save & restore original default route =====
 save_original_route() {
   ip -4 route show default | head -n1 > "$ORIG_ROUTE_FILE" 2>/dev/null
   if [[ -s "$ORIG_ROUTE_FILE" ]]; then
@@ -147,7 +157,6 @@ save_original_route() {
   fi
 }
 
-# ===== Restore original default route =====
 restore_original_route() {
   if [[ -f "$ORIG_ROUTE_FILE" ]]; then
     local line
@@ -171,7 +180,7 @@ enable_warp_ipv4() {
   cp "$WGCF_CONF" "${WG_DIR}/${WG_IF}.conf"
 
   echo_info "Saving original default route..."
-  save_original_route
+  save_original_route()
 
   echo_info "Enabling and starting ${SERVICE_NAME}..."
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -183,7 +192,7 @@ enable_warp_ipv4() {
     echo_ok "WARP service ${SERVICE_NAME} is active."
   else
     echo_err "WARP service failed to start. Check: systemctl status ${SERVICE_NAME}"
-    # حتی اگر سرویس fail شد، status را نشان بدهیم
+    # continue to show status anyway
   fi
 
   echo_info "Forcing default IPv4 route through ${WG_IF}..."
@@ -295,10 +304,10 @@ full_uninstall() {
 
   echo_info "Removing Cloudflare WARP (warp-cli) package if installed..."
   if dpkg -l | grep -q cloudflare-warp; then
-    apt remove --purge -y cloudflare-warp || true
+    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y cloudflare-warp >/dev/null 2>&1 || true
     rm -f /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
     rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
-    apt autoremove -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
   fi
 
   echo_info "Restoring original default route (if saved)..."
