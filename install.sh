@@ -1,537 +1,276 @@
 #!/usr/bin/env bash
-# Simple Cloudflare WARP Menu (Safe Proxy-Only Edition)
-# Author: Parham
-# - Ubuntu 24 (noble -> jammy)
-# - ONLY proxy mode (SOCKS5 127.0.0.1:10808)
-# - No full-tunnel "warp" mode (to avoid breaking VPS connectivity)
+# Cloudflare WARP Manager (Parham + CFwarp integration)
+# Ubuntu 24.x friendly
 
-# ================= Auto-install on first run =================
-SCRIPT_PATH="/usr/local/bin/warp-menu"
+set -e
 
-if [[ "$0" != "$SCRIPT_PATH" ]]; then
-  if [[ -f "$0" ]]; then
-    echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    echo "[✓] Installed! Next time just run: sudo warp-menu"
-  else
-    echo "[*] Running from non-regular file (pipe/FIFO), skipping auto-install."
-  fi
+### === Root check & auto-sudo ===
+if [[ $EUID -ne 0 ]]; then
+  echo "[*] This script must run as root. Re-running with sudo..."
+  exec sudo -E bash "$0" "$@"
 fi
 
-# ================= Colors & Version =================
+### === Auto-install path ===
+SCRIPT_PATH="/usr/local/bin/warp-menu"
+CURRENT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" && -f "$CURRENT_PATH" ]]; then
+  echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
+  cp "$CURRENT_PATH" "$SCRIPT_PATH"
+  chmod +x "$SCRIPT_PATH"
+  echo "[OK] warp-menu installed. Next time you can just run: warp-menu"
+fi
+
+### === Colors & version ===
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
-VERSION="3.1-parham-safe-proxy"
+BOLD='\033[1m'
+VERSION="4.0-parham-cfwarp"
 
-# ================= Root check =================
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}Please run this script as root (sudo).${NC}"
-  exit 1
-fi
+### === Helper print functions ===
+msg_info()  { echo -e "${CYAN}[*]${NC} $1"; }
+msg_ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
+msg_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+msg_err()   { echo -e "${RED}[ERR]${NC} $1"; }
 
-# ================= Paths & Files =================
-CONFIG_DIR="/etc/warp-menu"
-ENDPOINTS_FILE="${CONFIG_DIR}/endpoints.list"
-CURRENT_ENDPOINT_FILE="${CONFIG_DIR}/current_endpoint"
+### === Check command existence ===
+have_cmd() { command -v "$1" &>/dev/null; }
 
-mkdir -p "$CONFIG_DIR"
-touch "$ENDPOINTS_FILE" 2>/dev/null || true
+### === WARP-CLI (Cloudflare official) section ===
 
-# ================= Core Checks =================
-warp_is_installed() {
-  command -v warp-cli &>/dev/null
+warpcli_is_installed() {
+  have_cmd warp-cli
 }
 
-warp_is_connected() {
+warpcli_status_connected() {
   warp-cli status 2>/dev/null | grep -iq "Connected"
 }
 
-# ================= Helper: preload endpoints (Germany first) =================
-warp_preload_endpoints() {
-  if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-    cat << EOF > "$ENDPOINTS_FILE"
-Germany-1|188.114.98.10:2408
-Germany-2|188.114.99.10:2408
-Netherlands-1|162.159.192.10:2408
-Netherlands-2|162.159.193.10:2408
-Romania-1|188.114.96.10:2408
-Romania-2|188.114.97.10:2408
-France-1|162.159.195.10:2408
-UK-1|162.159.204.10:2408
-USA-1|162.159.208.10:2408
-USA-2|162.159.209.10:2408
-EOF
+warpcli_ensure_repo() {
+  if [[ ! -f /etc/apt/sources.list.d/cloudflare-client.list ]]; then
+    msg_info "Adding Cloudflare WARP APT repository..."
+    apt update
+    apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo
+
+    local codename
+    codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+    case "$codename" in
+      oracular|plucky|noble) codename="jammy" ;;
+    esac
+
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+      | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
+      > /etc/apt/sources.list.d/cloudflare-client.list
   fi
 }
 
-# ================= Helpers: IP detection via SOCKS5 =================
-warp_get_out_ip4() {
-  local proxy_ip="127.0.0.1"
-  local proxy_port="10808"
-  local ip=""
-  local timeout_sec=6
-
-  local services=(
-    "https://ipv4.icanhazip.com"
-    "https://api.ipify.org"
-    "https://checkip.amazonaws.com"
-    "https://ifconfig.me/ip"
-    "https://ipecho.net/plain"
-  )
-
-  for s in "${services[@]}"; do
-    ip=$(timeout "$timeout_sec" curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" "$s" 2>/dev/null | tr -d ' \r\n')
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-
-  echo ""
-  return 1
-}
-
-warp_get_out_ip6() {
-  local proxy_ip="127.0.0.1"
-  local proxy_port="10808"
-  local ip=""
-  local timeout_sec=8
-
-  local services=(
-    "https://ipv6.icanhazip.com"
-    "https://api64.ipify.org"
-    "https://ifconfig.co/ip"
-  )
-
-  for s in "${services[@]}"; do
-    ip=$(timeout "$timeout_sec" curl -6 -s --socks5 "${proxy_ip}:${proxy_port}" "$s" 2>/dev/null | tr -d ' \r\n')
-    if [[ -n "$ip" && "$ip" =~ : ]]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-
-  echo ""
-  return 1
-}
-
-# ================= Helpers: Endpoint =================
-warp_set_custom_endpoint() {
-  local endpoint="$1"
-  if [[ -z "$endpoint" ]]; then
-    echo -e "${RED}Endpoint is empty.${NC}"
-    return 1
+warpcli_install() {
+  if warpcli_is_installed; then
+    msg_warn "warp-cli is already installed."
+    read -rp "Reinstall anyway? [y/N]: " r
+    [[ ! "$r" =~ ^[Yy]$ ]] && return
   fi
 
-  echo -e "${CYAN}Setting custom endpoint to ${YELLOW}${endpoint}${NC}"
-  warp-cli clear-custom-endpoint 2>/dev/null || true
-  sleep 1
-  warp-cli set-custom-endpoint "$endpoint" 2>/dev/null || warp-cli custom-endpoint "$endpoint" 2>/dev/null || true
-  sleep 1
-}
-
-# ================= Safe Proxy Mode (repair / enforce) =================
-warp_enable_proxy_mode() {
-  echo -e "${CYAN}Switching WARP to SAFE PROXY mode (SOCKS5 127.0.0.1:10808)...${NC}"
-
-  if ! warp_is_installed; then
-    echo -e "${RED}WARP is not installed. Use Install first.${NC}"
-    return 1
-  fi
-
-  warp-cli disconnect 2>/dev/null || true
-  sleep 1
-
-  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
-  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808 2>/dev/null || true
-
-  warp-cli connect
-  sleep 3
-
-  if warp_is_connected; then
-    echo -e "${GREEN}WARP is now in PROXY mode (SOCKS5 127.0.0.1:10808).${NC}"
-  else
-    echo -e "${RED}Failed to enable PROXY mode.${NC}"
-  fi
-}
-
-warp_show_mode() {
-  echo -e "${CYAN}Current WARP settings:${NC}"
-  warp-cli settings 2>/dev/null || echo -e "${RED}warp-cli settings failed${NC}"
-}
-
-# ================= Core: install =================
-warp_install() {
-  if warp_is_installed && warp_is_connected; then
-    echo -e "${GREEN}WARP already installed and connected.${NC}"
-    read -r -p "Reinstall? [y/N]: " ans
-    [[ ! "$ans" =~ ^[Yy]$ ]] && return
-  fi
-
-  echo -e "${CYAN}Installing Cloudflare WARP...${NC}"
-  local codename
-  codename=$(lsb_release -cs 2>/dev/null || echo "")
-
-  # Map Ubuntu 24 (noble) and future to jammy
-  if [[ -z "$codename" ]]; then
-    codename="jammy"
-  elif [[ "$codename" == "oracular" || "$codename" == "plucky" || "$codename" == "noble" ]]; then
-    codename="jammy"
-  fi
-
-  apt update
-  apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo jq bc iputils-ping
-
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-
-  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
-    > /etc/apt/sources.list.d/cloudflare-client.list
-
+  msg_info "Installing warp-cli..."
+  warpcli_ensure_repo
   apt update
   apt install -y cloudflare-warp
 
-  warp_connect_initial
+  msg_info "Initial registration and setup..."
+  warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register
+
+  warpcli_set_proxy_mode
+  warpcli_connect
+
+  msg_ok "warp-cli installation finished."
+  warpcli_show_status
 }
 
-# ================= Core: initial connect (proxy mode + Germany) =================
-warp_connect_initial() {
-  echo -e "${BLUE}Initial WARP setup (proxy mode, Germany)...${NC}"
+warpcli_set_proxy_mode() {
+  msg_info "Setting warp-cli to proxy mode (SOCKS5 127.0.0.1:10808)..."
+  warp-cli --accept-tos set-mode proxy 2>/dev/null || warp-cli --accept-tos mode proxy
+  warp-cli --accept-tos set-proxy-port 10808 2>/dev/null || warp-cli --accept-tos proxy port 10808
+  sleep 2
+}
 
-  yes | warp-cli registration new 2>/dev/null || \
-  warp-cli registration new 2>/dev/null || \
-  warp-cli register 2>/dev/null
-
-  # Safe proxy mode
-  warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
-  warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808 2>/dev/null || true
-
-  # default endpoint: Germany
-  warp_set_custom_endpoint "188.114.98.10:2408"
-  echo "Germany-1|188.114.98.10:2408" > "$CURRENT_ENDPOINT_FILE"
-
-  warp-cli connect
+warpcli_connect() {
+  msg_info "Connecting warp-cli..."
+  warp-cli --accept-tos connect || true
   sleep 3
-
-  if warp_is_connected; then
-    echo -e "${GREEN}WARP connected (Germany endpoint, proxy mode).${NC}"
-  else
-    echo -e "${YELLOW}Germany endpoint failed. Trying auto endpoint...${NC}"
-    warp-cli clear-custom-endpoint 2>/dev/null || true
-    warp-cli connect
-    sleep 3
-  fi
-
-  warp_status
-}
-
-# ================= Core: connect / disconnect / status =================
-warp_connect() {
-  echo -e "${BLUE}Connecting WARP...${NC}"
-
-  if ! warp_is_installed; then
-    echo -e "${RED}cloudflare-warp not installed. Use option 1 first.${NC}"
-    return 1
-  fi
-
-  if ! warp-cli registration show >/dev/null 2>&1; then
-    yes | warp-cli registration new 2>/dev/null || \
-    warp-cli registration new 2>/dev/null || \
-    warp-cli register 2>/dev/null
-  fi
-
-  warp-cli connect
-  sleep 3
-
-  if warp_is_connected; then
-    echo -e "${GREEN}Connected.${NC}"
-  else
-    echo -e "${RED}Failed to connect.${NC}"
-  fi
-}
-
-warp_disconnect() {
-  echo -e "${YELLOW}Disconnecting WARP...${NC}"
-  warp-cli disconnect 2>/dev/null || true
-  sleep 1
-}
-
-warp_status() {
-  echo -e "${CYAN}=== WARP Status (warp-cli) ===${NC}"
-  if warp_is_installed; then
-    warp-cli status 2>/dev/null || echo -e "${RED}warp-cli status error${NC}"
-  else
-    echo -e "${RED}warp-cli not installed.${NC}"
-  fi
-  echo
-
-  if warp_is_connected; then
-    echo -e "${CYAN}=== Proxy and IP Info (proxy mode) ===${NC}"
-    local ip4 ip6
-    ip4=$(warp_get_out_ip4)
-    ip6=$(warp_get_out_ip6)
-
-    if [[ -n "$ip4" ]]; then
-      echo -e "  IPv4 via WARP SOCKS5 (127.0.0.1:10808): ${GREEN}$ip4${NC}"
-    else
-      echo -e "  ${YELLOW}IPv4 via SOCKS5: N/A (check proxy mode)${NC}"
-    fi
-
-    if [[ -n "$ip6" ]]; then
-      echo -e "  IPv6 via WARP/Cloudflare: ${GREEN}$ip6${NC}"
-    else
-      echo -e "  ${YELLOW}IPv6 via WARP: Not detected or blocked${NC}"
-    fi
-  else
-    echo -e "${YELLOW}WARP is not connected.${NC}"
-  fi
-}
-
-warp_test_proxy() {
-  echo -e "${CYAN}Testing SOCKS5 proxy (127.0.0.1:10808)...${NC}"
-
-  if ! warp_is_connected; then
-    echo -e "${RED}WARP is not connected.${NC}"
-    return 1
-  fi
-
-  local ip4 ip6
-  ip4=$(warp_get_out_ip4)
-  ip6=$(warp_get_out_ip6)
-
-  if [[ -n "$ip4" ]]; then
-    echo -e "[OK] IPv4 via WARP: ${GREEN}$ip4${NC}"
-  else
-    echo -e "[FAIL] ${RED}Could not get IPv4 via proxy.${NC}"
-  fi
-
-  if [[ -n "$ip6" ]]; then
-    echo -e "[OK] IPv6 via WARP: ${GREEN}$ip6${NC}"
-  else
-    echo -e "[INFO] IPv6 via WARP not detected (may be normal)."
-  fi
-}
-
-warp_remove() {
-  echo -e "${RED}Removing WARP...${NC}"
-  warp-cli disconnect 2>/dev/null || true
-  sleep 1
-  apt remove --purge -y cloudflare-warp 2>/dev/null || true
-  rm -f /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
-  rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
-  apt autoremove -y 2>/dev/null || true
-  echo -e "${GREEN}WARP removed.${NC}"
-}
-
-# ================= IP Change =================
-warp_quick_change_ip() {
-  if ! warp_is_connected; then
-    echo -e "${RED}WARP is not connected.${NC}"
-    return 1
-  fi
-
-  echo -e "${CYAN}Quick IP change (disconnect/connect)...${NC}"
-  local old_ip new_ip
-  old_ip=$(warp_get_out_ip4)
-  echo -e "Old IPv4: ${YELLOW}${old_ip:-N/A}${NC}"
-
-  for i in {1..3}; do
-    echo "Attempt $i/3..."
-    warp_disconnect
-    warp_connect
-    sleep 2
-    new_ip=$(warp_get_out_ip4)
-    if [[ -n "$new_ip" && "$new_ip" != "$old_ip" ]]; then
-      echo -e "New IPv4: ${GREEN}$new_ip${NC}"
+  local n=0
+  while [[ $n -lt 10 ]]; do
+    if warpcli_status_connected; then
+      msg_ok "WARP (warp-cli) is connected."
       return 0
     fi
+    sleep 1
+    n=$((n+1))
   done
-
-  echo -e "${YELLOW}IP did not change. Try New Identity.${NC}"
+  msg_err "Failed to connect warp-cli."
+  return 1
 }
 
-warp_new_identity() {
-  if ! warp_is_installed; then
-    echo -e "${RED}WARP not installed.${NC}"
+warpcli_disconnect() {
+  msg_info "Disconnecting warp-cli..."
+  warp-cli --accept-tos disconnect 2>/dev/null || true
+  sleep 2
+}
+
+warpcli_remove() {
+  msg_warn "Removing warp-cli and Cloudflare WARP package..."
+  warpcli_disconnect || true
+  if [[ -f /etc/apt/sources.list.d/cloudflare-client.list ]]; then
+    apt remove --purge -y cloudflare-warp || true
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    apt autoremove -y || true
+  fi
+  msg_ok "warp-cli removed."
+}
+
+warpcli_test_proxy() {
+  if ! warpcli_is_installed; then
+    msg_err "warp-cli is not installed."
     return 1
   fi
+  if ! warpcli_status_connected; then
+    msg_warn "warp-cli is not connected; trying to connect..."
+    warpcli_connect || return 1
+  fi
 
-  echo -e "${CYAN}New identity (re-registration)...${NC}"
-  local old_ip new_ip
-  old_ip=$(warp_get_out_ip4)
-  echo -e "Old IPv4: ${YELLOW}${old_ip:-N/A}${NC}"
-
-  warp_disconnect
-
-  warp-cli registration delete 2>/dev/null || \
-  warp-cli deregister 2>/dev/null || \
-  warp-cli registration revoke 2>/dev/null || true
-
-  sleep 1
-
-  yes | warp-cli registration new 2>/dev/null || \
-  warp-cli registration new 2>/dev/null || \
-  warp-cli register 2>/dev/null
-
-  warp-cli connect
-  sleep 3
-
-  new_ip=$(warp_get_out_ip4)
-  if [[ -n "$new_ip" ]]; then
-    if [[ "$new_ip" != "$old_ip" ]]; then
-      echo -e "New IPv4: ${GREEN}$new_ip${NC}"
-    else
-      echo -e "${YELLOW}New identity but same IP; try again later.${NC}"
-    fi
+  msg_info "Testing SOCKS5 proxy (127.0.0.1:10808)..."
+  local url ip
+  url="https://ipv4.icanhazip.com"
+  ip=$(timeout 10 curl -4 -s --socks5 127.0.0.1:10808 "$url" 2>/dev/null | tr -d ' \r\n')
+  if [[ -n "$ip" ]]; then
+    msg_ok "Proxy works. Outbound IP: ${ip}"
   else
-    echo -e "${RED}Failed to get new IP.${NC}"
+    msg_err "Failed to get IP via SOCKS5 proxy."
   fi
 }
 
-# ================= Multi-location =================
-warp_list_endpoints() {
-  if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-    echo -e "${YELLOW}No endpoints saved.${NC}"
-    return 1
-  fi
-
-  echo -e "${CYAN}Saved endpoints:${NC}"
-  echo "----------------------------------------"
-  local i=1
-  while IFS='|' read -r name addr; do
-    [[ -z "$name" ]] && continue
-    printf " %2d) %-15s %s\n" "$i" "$name" "$addr"
-    i=$((i+1))
-  done < "$ENDPOINTS_FILE"
-}
-
-warp_apply_endpoint() {
-  if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-    echo -e "${YELLOW}No endpoints saved.${NC}"
-    return 1
-  fi
-
-  warp_list_endpoints
-  echo
-  read -r -p "Select endpoint number (0 to cancel): " idx
-  [[ -z "$idx" ]] && return
-
-  if [[ "$idx" -eq 0 ]]; then
-    echo "Cancelled."
+warpcli_show_status() {
+  echo -e "${CYAN}===== warp-cli status =====${NC}"
+  if warpcli_is_installed; then
+    warp-cli status 2>/dev/null || msg_err "warp-cli status failed."
+  else
+    msg_warn "warp-cli is not installed."
     return
   fi
 
-  local line
-  line=$(sed -n "${idx}p" "$ENDPOINTS_FILE" 2>/dev/null || true)
-  if [[ -z "$line" ]]; then
-    echo -e "${RED}Invalid selection.${NC}"
-    return 1
-  fi
-
-  local name addr
-  name="${line%%|*}"
-  addr="${line#*|}"
-
-  echo -e "${CYAN}Applying endpoint: ${YELLOW}${name}${NC} -> ${GREEN}${addr}${NC}"
-  warp_disconnect
-  warp_set_custom_endpoint "$addr"
-  echo "${name}|${addr}" > "$CURRENT_ENDPOINT_FILE"
-  warp_enable_proxy_mode
-  warp_status
-}
-
-warp_multiloc_menu() {
-  while true; do
-    clear
-    echo "================ Multi-location Manager ================"
-    warp_list_endpoints
-    echo
-    echo " 1) Apply endpoint from list"
-    echo " 0) Back to main menu"
-    echo "======================================================="
-    echo -ne "${YELLOW}Select option: ${NC}"
-    read -r ch
-
-    case "$ch" in
-      1) warp_apply_endpoint ;;
-      0) break ;;
-      *) echo -e "${RED}Invalid choice.${NC}"; sleep 1 ;;
-    esac
-
-    echo
-    echo "Press Enter to continue..."
-    read -r
-  done
-}
-
-# ================= Menu =================
-warp_draw_menu() {
-  clear
-  local status="NOT INSTALLED"
-  local status_color="$RED"
-  local ip4="N/A"
-
-  if warp_is_installed; then
-    if warp_is_connected; then
-      status="CONNECTED"
-      status_color="$GREEN"
-      ip4=$(warp_get_out_ip4 || echo "N/A")
-    else
-      status="DISCONNECTED"
-      status_color="$YELLOW"
+  if warpcli_status_connected; then
+    local ip
+    ip=$(timeout 10 curl -4 -s --socks5 127.0.0.1:10808 https://ipv4.icanhazip.com 2>/dev/null | tr -d ' \r\n')
+    if [[ -n "$ip" ]]; then
+      echo -e "${GREEN}Proxy outbound IP:${NC} ${YELLOW}${ip}${NC}"
     fi
   fi
-
-  echo "======================================================="
-  echo "               WARP Manager v${VERSION}"
-  echo "======================================================="
-  echo -e " Status : ${status_color}${status}${NC}"
-  echo -e " SOCKS5 : 127.0.0.1:10808 (proxy mode only)"
-  echo -e " IPv4   : ${YELLOW}${ip4}${NC}"
-  echo "-------------------------------------------------------"
-  echo " 1) Install WARP"
-  echo " 2) Status & Info"
-  echo " 3) Test Proxy (IPv4/IPv6)"
-  echo " 4) Remove WARP"
-  echo " 5) Quick IP Change"
-  echo " 6) New Identity (re-register)"
-  echo " 7) Multi-location (Germany/NL/...)"
-  echo " 8) Re-apply SAFE proxy mode (repair)"
-  echo " 9) Show WARP settings/mode"
-  echo " 0) Exit"
-  echo "-------------------------------------------------------"
-  echo -ne "${YELLOW}Select option: ${NC}"
+  echo
 }
 
-warp_main_menu() {
-  warp_preload_endpoints
+### === CFwarp integration (yonggekkk script) ===
+# This integrates the known-stable Chinese CFwarp script.
+# It installs a 'cf' command that manages system-level WARP (IPv4 / IPv6 / dual stack).
 
+cfwarp_is_installed() {
+  have_cmd cf
+}
+
+cfwarp_install() {
+  if cfwarp_is_installed; then
+    msg_ok "CFwarp (command 'cf') is already installed."
+    return 0
+  fi
+
+  msg_info "Installing CFwarp (yonggekkk warp-yg script)..."
+  curl -sSL -o /usr/bin/cf -L https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh
+  chmod +x /usr/bin/cf
+
+  if cfwarp_is_installed; then
+    msg_ok "CFwarp installed. You can run its menu with: cf"
+  else
+    msg_err "Failed to install CFwarp."
+    return 1
+  fi
+}
+
+cfwarp_menu() {
+  cfwarp_install || return 1
+
+  cat <<EOF
+
+============================================================
+  CFwarp system-level WARP manager (command: cf)
+============================================================
+
+- This is the script you said works perfectly:
+  * Gives a stable Cloudflare IP on IPv4
+  * Routes all traffic correctly without drops.
+
+- After opening the 'cf' menu you can:
+  * Choose WARP mode: IPv4 only, IPv6 only or dual stack
+  * Tune MTU / endpoints and other options
+
+Important:
+- When you enable system-level WARP IPv4 via CFwarp,
+  all server traffic (including x-ui / Xray "direct" outbound)
+  will automatically exit through the WARP IP.
+
+Now entering CFwarp menu...
+
+EOF
+
+  read -rp "Press Enter to open CFwarp menu... " _
+  cf
+}
+
+### === Main menu ===
+
+draw_menu() {
+  clear
+  echo -e "${CYAN}============================================================${NC}"
+  echo -e "${BOLD}         Cloudflare WARP Manager - Parham Edition${NC}"
+  echo -e "                       Version: ${PURPLE}${VERSION}${NC}"
+  echo -e "${CYAN}============================================================${NC}"
+  echo
+  echo -e "${BOLD}Options:${NC}"
+  echo "  1) Install / setup WARP with warp-cli (SOCKS5 proxy mode)"
+  echo "  2) Show warp-cli status and test SOCKS5 proxy"
+  echo "  3) Reconnect warp-cli"
+  echo "  4) Disconnect and remove warp-cli"
+  echo
+  echo "  5) Manage system-level WARP using CFwarp (command: cf)"
+  echo
+  echo "  0) Exit"
+  echo
+}
+
+main_loop() {
   while true; do
-    warp_draw_menu
-    read -r choice
-    case "$choice" in
-      1) warp_install ;;
-      2) warp_status ;;
-      3) warp_test_proxy ;;
-      4) warp_remove ;;
-      5) warp_quick_change_ip ;;
-      6) warp_new_identity ;;
-      7) warp_multiloc_menu ;;
-      8) warp_enable_proxy_mode ;;
-      9) warp_show_mode ;;
-      0) echo -e "${GREEN}Bye.${NC}"; exit 0 ;;
-      *) echo -e "${RED}Invalid choice.${NC}" ;;
+    draw_menu
+    read -rp "Select an option: " ans
+    case "$ans" in
+      1) warpcli_install ;;
+      2) warpcli_show_status; warpcli_test_proxy ;;
+      3) warpcli_connect ;;
+      4) warpcli_remove ;;
+      5) cfwarp_menu ;;
+      0) echo -e "${GREEN}Exit.${NC}"; exit 0 ;;
+      *) msg_err "Invalid option."; sleep 1 ;;
     esac
-
     echo
-    echo "Press Enter to return to menu..."
-    read -r
+    read -rp "Press Enter to continue... " _
   done
 }
 
-# ================= Start =================
-warp_main_menu
+### === Entry point ===
+
+main_loop
+```0
