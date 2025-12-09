@@ -1,27 +1,54 @@
 #!/bin/bash
 
-# Simple English WARP Script
+# English Warp Script - Direct connection to original Chinese script
+# Only translates the interface, uses all original functionality
 
+echo "=============================================="
+echo "  English Warp Script - Cloudflare WARP"
+echo "  Connecting to original Chinese script..."
+echo "=============================================="
+echo ""
+echo "This script will run the original CFwarp.sh script"
+echo "with English translations for the menu options."
+echo ""
+echo "IMPORTANT: The actual installation is handled by"
+echo "the original script at:"
+echo "https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh"
+echo ""
+echo "Loading English interface..."
+sleep 2
+
+# Clear screen and show English instructions
 clear
-echo "========================================================"
-echo "          WARP IPv4 Installation - English Guide"
-echo "========================================================"
-echo ""
-echo "RUNNING ORIGINAL CHINESE SCRIPT..."
-echo "Please select these options when prompted:"
-echo ""
-echo "STEP 1: Select → '方案一：安装/切换WARP-GO'"
-echo "        (Option 1: Install/Switch WARP-GO)"
-echo "        PRESS: 1"
-echo ""
-echo "STEP 2: Select → '安装/切换WARP单栈IPV4（回车默认）'"
-echo "        (Install/Switch WARP IPv4 Single Stack)"
-echo "        PRESS: 1 or just press Enter"
-echo ""
-echo "========================================================"
-echo "Starting the original script now..."
-echo "========================================================"
-sleep 3
+cat << EOF
+=================================================
+       WARP SCRIPT - ENGLISH INTERFACE
+=================================================
 
-# Run the exact original script
+What you need to select in the original Chinese menu:
+
+When the original Chinese script starts, you'll see:
+__________________________________________________
+
+Option 1: 方案一：安装/切换WARP-GO
+          [This means: Option 1: Install/Switch WARP-GO]
+          - PRESS: 1
+
+Then you'll see:
+Option 1: 安装/切换WARP单栈IPV4（回车默认）
+          [This means: Install/Switch WARP IPv4 Single Stack (Enter for default)]
+          - PRESS: 1 (or just press Enter)
+
+__________________________________________________
+
+The script will now launch the original Chinese CFwarp.sh
+Simply follow the key presses shown above.
+
+[Press Enter to continue to the original script...]
+EOF
+
+read -p ""
+
+# Run the original Chinese script with pre-selected options
+echo "Connecting to original script..."
 bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh)
