@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Cloudflare multi-IP CNAME creator with two A records
-# Creates: 
-#   srv-xxxx-1.base.tld -> IP1
-#   srv-xxxx-2.base.tld -> IP2  
-#   srv-xxxx.base.tld (CNAME) -> srv-xxxx-1.base.tld & srv-xxxx-2.base.tld
+# Cloudflare Load Balancer Creator with Auto-Failover
+# Creates:
+#   Two A records (primary and backup)
+#   Cloudflare Load Balancer with health checks
+#   CNAME pointing to Load Balancer with auto-failover
 
 set -euo pipefail
 
-TOOL_NAME="cf-multi-ip-cname"
+TOOL_NAME="cf-loadbalancer-failover"
 CONFIG_DIR="$HOME/.${TOOL_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config"
-LOG_FILE="${CONFIG_DIR}/created_hosts.log"
-LAST_CNAME_FILE="${CONFIG_DIR}/last_cname.txt"
+LOG_FILE="${CONFIG_DIR}/created_resources.log"
+LAST_LB_FILE="${CONFIG_DIR}/last_loadbalancer.txt"
 
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
-CF_PROXY="false"   # always DNS-only (proxy off)
+HEALTH_CHECK_INTERVAL=15  # seconds
 
 pause() {
   read -rp "Press Enter to continue..." _
@@ -65,45 +65,32 @@ save_config() {
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
-CF_PROXY="$CF_PROXY"
 EOF
   echo "==> Config saved to $CONFIG_FILE"
   echo
 }
 
-api_get() {
-  local url="$1"
-  shift || true
-  curl -sS -H "Authorization: Bearer $CF_API_TOKEN" \
-       -H "Content-Type: application/json" \
-       -G "$url" \
-       "$@" 2>/dev/null || echo '{"success":false,"errors":[{"code":0,"message":"curl failed"}]}'
-}
-
-api_post() {
-  local url="$1"
-  local data="$2"
+api_request() {
+  local method="$1"
+  local url="$2"
+  local data="${3:-}"
   
-  curl -sS -X POST "$url" \
-       -H "Authorization: Bearer $CF_API_TOKEN" \
-       -H "Content-Type: application/json" \
-       --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"code":0,"message":"curl failed"}]}'
-}
-
-api_delete() {
-  local url="$1"
+  local curl_cmd="curl -sS -X $method '$url' \
+    -H 'Authorization: Bearer $CF_API_TOKEN' \
+    -H 'Content-Type: application/json'"
+    
+  if [[ -n "$data" ]]; then
+    curl_cmd="$curl_cmd --data '$data'"
+  fi
   
-  curl -sS -X DELETE "$url" \
-       -H "Authorization: Bearer $CF_API_TOKEN" \
-       -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"code":0,"message":"curl failed"}]}'
+  eval "$curl_cmd" 2>/dev/null || echo '{"success":false,"errors":[{"code":0,"message":"API request failed"}]}'
 }
 
 test_config() {
   echo "==> Testing Cloudflare Zone ID and API token..."
-  local url resp success zone_name
-  url="${CF_API_BASE}/zones/${CF_ZONE_ID}"
-  resp=$(api_get "$url")
-
+  local resp success zone_name
+  
+  resp=$(api_request "GET" "${CF_API_BASE}/zones/${CF_ZONE_ID}")
   success=$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo "false")
 
   if [[ "$success" != "true" ]]; then
@@ -122,8 +109,7 @@ test_config() {
     echo "   BASE_HOST is not equal to the zone name or a subdomain of it."
     echo "   Zone name : $zone_name"
     echo "   BASE_HOST : $BASE_HOST"
-    echo "   Records will only work correctly if BASE_HOST is the zone or its subdomain."
-    echo "   Example for this zone: $zone_name or nodes.$zone_name"
+    echo "   Load Balancer will only work correctly if BASE_HOST is the zone or its subdomain."
     echo
   fi
   return 0
@@ -139,16 +125,13 @@ configure_if_needed() {
   fi
 
   echo "=== Cloudflare configuration ==="
-  echo "You need a Cloudflare API token with:"
-  echo "  - Zone.DNS (Edit) permissions"
+  echo "You need a Cloudflare API token with these permissions:"
+  echo "  - Zone.DNS (Edit)"
+  echo "  - Zone.Load Balancing (Edit)"
   echo
   read -rp "Enter Cloudflare API Token: " CF_API_TOKEN
   read -rp "Enter Cloudflare Zone ID: " CF_ZONE_ID
-  read -rp "Enter base hostname (e.g. example.com or nodes.example.com): " BASE_HOST
-
-  CF_PROXY="false"   # always DNS only
-  echo "Cloudflare proxy will be disabled (DNS only)."
-  echo
+  read -rp "Enter base hostname (e.g. example.com or lb.example.com): " BASE_HOST
 
   ensure_dir
   save_config
@@ -175,99 +158,243 @@ random_subdomain() {
   tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 8 || echo "$(date +%s%N | md5sum | head -c 8)"
 }
 
-cleanup_on_error() {
-  echo
-  echo "⚠️  Cleaning up due to error..."
+create_monitor() {
+  echo "Creating Health Check Monitor..."
   
-  if [[ -n "${created_records[@]}" ]]; then
-    for rec_id in "${created_records[@]}"; do
-      if [[ -n "$rec_id" ]]; then
-        echo "  Deleting record: $rec_id"
-        api_delete "${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records/${rec_id}" >/dev/null
-      fi
-    done
-  fi
+  local monitor_name="monitor-primary-${1}"
+  local monitor_data
   
-  echo "Cleanup completed."
-}
-
-create_dns_record() {
-  local name="$1"
-  local type="$2"
-  local content="$3"
-  
-  local data
-  data=$(cat <<EOF
+  monitor_data=$(cat <<EOF
 {
-  "type": "$type",
-  "name": "$name",
-  "content": "$content",
-  "ttl": 1,
-  "proxied": $CF_PROXY
+  "type": "http",
+  "description": "Primary server health check",
+  "method": "GET",
+  "path": "/",
+  "header": {},
+  "port": 80,
+  "timeout": 5,
+  "retries": 2,
+  "interval": $HEALTH_CHECK_INTERVAL,
+  "expected_body": "",
+  "expected_codes": "200,301,302",
+  "follow_redirects": true,
+  "allow_insecure": false
 }
 EOF
 )
-
-  local url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records"
+  
   local resp
-  resp=$(api_post "$url" "$data")
-
-  local success
-  success=$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo "false")
-
+  resp=$(api_request "POST" "${CF_API_BASE}/user/load_balancers/monitors" "$monitor_data")
+  local success=$(echo "$resp" | jq -r '.success // false')
+  
   if [[ "$success" != "true" ]]; then
-    echo "❌ Cloudflare error while creating $type record for $name:"
+    echo "❌ Failed to create health check monitor:"
     echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
     return 1
   fi
+  
+  local monitor_id=$(echo "$resp" | jq -r '.result.id')
+  echo "✅ Health Check Monitor created (ID: $monitor_id)"
+  echo "$monitor_id"
+}
 
-  local rec_id
-  rec_id=$(echo "$resp" | jq -r '.result.id // empty')
-  echo "✅ Created $type record: $name -> $content (ID: $rec_id)"
+create_pool() {
+  local pool_name="$1"
+  local primary_ip="$2"
+  local backup_ip="$3"
+  local monitor_id="$4"
   
-  # Log the creation
-  echo "$(date +'%Y-%m-%d %H:%M:%S') CREATE $name $type $content $rec_id" >> "$LOG_FILE"
+  echo "Creating Load Balancer Pool: $pool_name"
   
-  # Return the record ID
-  echo "$rec_id"
+  local pool_data
+  
+  pool_data=$(cat <<EOF
+{
+  "name": "$pool_name",
+  "monitor": "$monitor_id",
+  "origins": [
+    {
+      "name": "primary-server",
+      "address": "$primary_ip",
+      "enabled": true,
+      "weight": 1,
+      "header": {}
+    },
+    {
+      "name": "backup-server",
+      "address": "$backup_ip",
+      "enabled": true,
+      "weight": 1,
+      "header": {}
+    }
+  ],
+  "notification_email": "",
+  "enabled": true,
+  "latitude": 0,
+  "longitude": 0,
+  "check_regions": ["WEU", "EEU", "ENAM", "WNAM"],
+  "description": "Auto-failover pool. Primary: $primary_ip, Backup: $backup_ip",
+  "minimum_origins": 1,
+  "origin_steering": {
+    "policy": "random"
+  }
+}
+EOF
+)
+  
+  local resp
+  resp=$(api_request "POST" "${CF_API_BASE}/user/load_balancers/pools" "$pool_data")
+  local success=$(echo "$resp" | jq -r '.success // false')
+  
+  if [[ "$success" != "true" ]]; then
+    echo "❌ Failed to create load balancer pool:"
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
+    return 1
+  fi
+  
+  local pool_id=$(echo "$resp" | jq -r '.result.id')
+  echo "✅ Load Balancer Pool created (ID: $pool_id)"
+  echo "$pool_id"
+}
+
+create_load_balancer() {
+  local lb_name="$1"
+  local pool_id="$2"
+  
+  echo "Creating Load Balancer: $lb_name"
+  
+  local lb_data
+  
+  lb_data=$(cat <<EOF
+{
+  "name": "$lb_name",
+  "description": "Auto-failover load balancer",
+  "ttl": 60,
+  "fallback_pool": "$pool_id",
+  "default_pools": ["$pool_id"],
+  "region_pools": {},
+  "pop_pools": {},
+  "country_pools": {},
+  "proxied": false,
+  "enabled": true,
+  "session_affinity": "none",
+  "session_affinity_attributes": {
+    "samesite": "Auto",
+    "secure": "Auto",
+    "zero_downtime_failover": "temporary"
+  },
+  "steering_policy": "dynamic_latency",
+  "rules": []
+}
+EOF
+)
+  
+  local resp
+  resp=$(api_request "POST" "${CF_API_BASE}/zones/${CF_ZONE_ID}/load_balancers" "$lb_data")
+  local success=$(echo "$resp" | jq -r '.success // false')
+  
+  if [[ "$success" != "true" ]]; then
+    echo "❌ Failed to create load balancer:"
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
+    return 1
+  fi
+  
+  local lb_id=$(echo "$resp" | jq -r '.result.id')
+  local lb_dns=$(echo "$resp" | jq -r '.result.name')
+  echo "✅ Load Balancer created (ID: $lb_id)"
+  echo "   DNS: $lb_dns"
+  echo "$lb_dns"
+}
+
+get_fallback_pool_settings() {
+  local pool_id="$1"
+  
+  echo
+  echo "=== Load Balancer Pool Settings ==="
+  echo "Primary IP:"
+  echo "  - Health checked every ${HEALTH_CHECK_INTERVAL} seconds"
+  echo "  - Marked as 'healthy' if responds with 200, 301, or 302"
+  echo "  - Timeout: 5 seconds, Retries: 2"
+  echo
+  echo "Failover Behavior:"
+  echo "  - Primary IP has priority"
+  echo "  - If primary fails health checks for 30+ seconds, traffic goes to backup"
+  echo "  - When primary recovers, traffic automatically returns to primary"
+  echo "  - Minimum origins required: 1 (works even if only backup is available)"
+  echo
+  echo "Checking regions: Western EU, Eastern EU, Eastern NA, Western NA"
+  echo
+}
+
+create_cname_for_lb() {
+  local lb_dns="$1"
+  local cname_host="$2"
+  
+  echo "Creating CNAME record pointing to Load Balancer..."
+  
+  local cname_data
+  
+  cname_data=$(cat <<EOF
+{
+  "type": "CNAME",
+  "name": "$cname_host",
+  "content": "$lb_dns",
+  "ttl": 1,
+  "proxied": false
+}
+EOF
+)
+  
+  local resp
+  resp=$(api_request "POST" "${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records" "$cname_data")
+  local success=$(echo "$resp" | jq -r '.success // false')
+  
+  if [[ "$success" != "true" ]]; then
+    echo "⚠️ Could not create CNAME record (might already exist):"
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
+    return 1
+  fi
+  
+  echo "✅ CNAME record created: $cname_host → $lb_dns"
   return 0
 }
 
 main_flow() {
-  echo "=== Cloudflare Multi-IP CNAME Creator ==="
-  echo "This script will create:"
-  echo "  1. Two A records with different subdomains"
-  echo "  2. One CNAME record pointing to both A records"
-  echo "  3. Final CNAME target for your use"
+  echo "=== Cloudflare Load Balancer with Auto-Failover ==="
+  echo "This script creates:"
+  echo "  1. Health Check Monitor (checks every ${HEALTH_CHECK_INTERVAL} seconds)"
+  echo "  2. Load Balancer Pool with Primary and Backup servers"
+  echo "  3. Load Balancer with auto-failover capability"
+  echo "  4. CNAME record pointing to the Load Balancer"
+  echo
+  echo "Failover behavior:"
+  echo "  • Primary IP gets all traffic when healthy"
+  echo "  • If Primary fails health checks, traffic switches to Backup"
+  echo "  • When Primary recovers, traffic automatically returns to Primary"
   echo
 
-  # Set up error handling
-  local -a created_records=()
-  trap cleanup_on_error EXIT
-
-  # Load or create config
   ensure_dir
   load_config
+  install_prereqs
   configure_if_needed
 
-  # Install prerequisites
-  install_prereqs
-
-  echo "==> Getting two IPv4 addresses"
-  local ip1 ip2
+  echo "==> Enter IP addresses for failover setup"
+  local primary_ip backup_ip
+  
   while true; do
-    read -rp "Enter first IPv4 address: " ip1
-    if valid_ipv4 "$ip1"; then
+    read -rp "Enter PRIMARY IPv4 (gets priority): " primary_ip
+    if valid_ipv4 "$primary_ip"; then
       break
     fi
     echo "❌ Invalid IPv4 address. Please try again."
   done
 
   while true; do
-    read -rp "Enter second IPv4 address: " ip2
-    if valid_ipv4 "$ip2"; then
-      if [[ "$ip1" == "$ip2" ]]; then
-        echo "⚠️  Both IPs are the same. Continue anyway? (y/n) "
+    read -rp "Enter BACKUP IPv4 (used when primary fails): " backup_ip
+    if valid_ipv4 "$backup_ip"; then
+      if [[ "$primary_ip" == "$backup_ip" ]]; then
+        echo "⚠️  Both IPs are the same. This defeats the purpose of failover."
+        echo "Continue anyway? (y/n) "
         read -r answer
         [[ "$answer" =~ ^[Yy]$ ]] && break
       else
@@ -278,96 +405,127 @@ main_flow() {
     fi
   done
 
-  # Generate unique subdomain
-  local rand sub1 sub2 main_sub full_main
-  rand=$(random_subdomain)
-  main_sub="srv-${rand}"
-  sub1="${main_sub}-1"
-  sub2="${main-sub}-2"
-  full_main="${main_sub}.${BASE_HOST}"
-  
   echo
-  echo "==> Creating DNS records..."
-  echo "    Main CNAME : $full_main"
-  echo "    A record 1 : $sub1.$BASE_HOST -> $ip1"
-  echo "    A record 2 : $sub2.$BASE_HOST -> $ip2"
+  echo "==> Generating unique identifiers..."
+  
+  local rand=$(random_subdomain)
+  local pool_name="pool-${rand}"
+  local lb_host="lb-${rand}.${BASE_HOST}"
+  local cname_host="app-${rand}.${BASE_HOST}"
+  
+  echo "   Pool Name: $pool_name"
+  echo "   Load Balancer: $lb_host"
+  echo "   Your CNAME: $cname_host"
   echo
 
-  # Create first A record
-  echo "1. Creating first A record..."
-  local rec1_id
-  rec1_id=$(create_dns_record "$sub1.$BASE_HOST" "A" "$ip1")
-  if [[ $? -ne 0 ]] || [[ -z "$rec1_id" ]]; then
-    echo "❌ Failed to create first A record"
+  # Step 1: Create Health Check Monitor
+  echo "Step 1/4: Creating Health Check Monitor..."
+  local monitor_id
+  monitor_id=$(create_monitor "$rand")
+  if [[ -z "$monitor_id" ]] || [[ "$monitor_id" == "null" ]]; then
+    echo "❌ Failed to create monitor. Exiting."
     exit 1
   fi
-  created_records+=("$rec1_id")
 
-  # Create second A record
-  echo "2. Creating second A record..."
-  local rec2_id
-  rec2_id=$(create_dns_record "$sub2.$BASE_HOST" "A" "$ip2")
-  if [[ $? -ne 0 ]] || [[ -z "$rec2_id" ]]; then
-    echo "❌ Failed to create second A record"
+  # Step 2: Create Load Balancer Pool
+  echo
+  echo "Step 2/4: Creating Load Balancer Pool..."
+  local pool_id
+  pool_id=$(create_pool "$pool_name" "$primary_ip" "$backup_ip" "$monitor_id")
+  if [[ -z "$pool_id" ]] || [[ "$pool_id" == "null" ]]; then
+    echo "❌ Failed to create pool. Exiting."
     exit 1
   fi
-  created_records+=("$rec2_id")
 
-  # IMPORTANT: In DNS, CNAME can only point to ONE target
-  # For load balancing between two IPs, we have two options:
-  # Option 1: Create CNAME pointing to first A record (simple)
-  # Option 2: Create two CNAME records (not standard)
-  
-  echo "3. Creating main CNAME record (pointing to first A record)..."
-  local cname_id
-  cname_id=$(create_dns_record "$full_main" "CNAME" "$sub1.$BASE_HOST")
-  if [[ $? -ne 0 ]] || [[ -z "$cname_id" ]]; then
-    echo "❌ Failed to create CNAME record"
+  # Step 3: Create Load Balancer
+  echo
+  echo "Step 3/4: Creating Load Balancer..."
+  local lb_dns
+  lb_dns=$(create_load_balancer "$lb_host" "$pool_id")
+  if [[ -z "$lb_dns" ]] || [[ "$lb_dns" == "null" ]]; then
+    echo "❌ Failed to create load balancer. Exiting."
     exit 1
   fi
-  created_records+=("$cname_id")
 
-  # Remove cleanup trap since everything succeeded
-  trap - EXIT
+  # Step 4: Create CNAME
+  echo
+  echo "Step 4/4: Creating CNAME record..."
+  create_cname_for_lb "$lb_dns" "$cname_host"
+
+  # Display settings
+  get_fallback_pool_settings "$pool_id"
 
   echo
   echo "==============================================="
-  echo "✅ SUCCESS! All records created."
+  echo "✅ SETUP COMPLETE!"
+  echo "==============================================="
   echo
-  echo "Your DNS configuration:"
+  echo "Your resources:"
   echo
-  echo "   $sub1.$BASE_HOST    A      $ip1"
-  echo "   $sub2.$BASE_HOST    A      $ip2"
-  echo "   $full_main    CNAME    $sub1.$BASE_HOST"
+  echo "   Health Check Monitor:"
+  echo "     • Checks every ${HEALTH_CHECK_INTERVAL} seconds"
+  echo "     • Expects HTTP 200, 301, or 302"
+  echo "     • Timeout: 5 seconds"
   echo
-  echo "⚠️  IMPORTANT NOTE:"
-  echo "   The CNAME points only to the first A record ($sub1.$BASE_HOST)."
-  echo "   For true load balancing between both IPs, you need to:"
-  echo "   1. Use DNS Round Robin manually with both A records, OR"
-  echo "   2. Use Cloudflare Load Balancing service, OR"
-  echo "   3. Configure your application to use both endpoints"
+  echo "   Load Balancer Pool:"
+  echo "     • Primary: $primary_ip (priority)"
+  echo "     • Backup:  $backup_ip"
+  echo "     • Pool ID: $pool_id"
   echo
-  echo "For DNS Round Robin, you can create TWO CNAME records elsewhere:"
-  echo "   your-alias1.example.com    CNAME    $sub1.$BASE_HOST"
-  echo "   your-alias2.example.com    CNAME    $sub2.$BASE_HOST"
+  echo "   Load Balancer DNS:"
+  echo "     • $lb_dns"
+  echo
+  echo "   Your CNAME endpoint:"
+  echo "     • $cname_host"
   echo
   echo "==============================================="
   echo
+  echo "📝 USAGE:"
+  echo "   1. Point your application to: $cname_host"
+  echo "   2. Cloudflare will automatically:"
+  echo "      - Send traffic to $primary_ip"
+  echo "      - Monitor it every ${HEALTH_CHECK_INTERVAL} seconds"
+  echo "      - If primary fails, switch to $backup_ip"
+  echo "      - When primary recovers, switch back automatically"
+  echo
+  echo "⚙️  To manage your Load Balancer:"
+  echo "   Login to Cloudflare Dashboard → Traffic → Load Balancing"
+  echo
 
-  # Save the main CNAME
-  echo "$full_main" > "$LAST_CNAME_FILE"
-  echo "Main CNAME target saved to: $LAST_CNAME_FILE"
+  # Save information
+  echo "$cname_host" > "$LAST_LB_FILE"
   
-  # Also save all created records
-  cat > "${CONFIG_DIR}/last_creation_$(date +%Y%m%d_%H%M%S).txt" <<EOF
-Created: $(date)
-Main CNAME: $full_main
-A Records:
-  $sub1.$BASE_HOST -> $ip1
-  $sub2.$BASE_HOST -> $ip2
+  cat > "${CONFIG_DIR}/lb_${rand}_$(date +%Y%m%d_%H%M%S).info" <<EOF
+Load Balancer Created: $(date)
+=================================
+CNAME Endpoint: $cname_host
+Load Balancer: $lb_dns
+Pool ID: $pool_id
+Monitor ID: $monitor_id
+
+IP Addresses:
+  Primary: $primary_ip
+  Backup:  $backup_ip
+
+Health Check:
+  Interval: ${HEALTH_CHECK_INTERVAL} seconds
+  Expected Codes: 200, 301, 302
+  Timeout: 5 seconds
+  Retries: 2
+
+Failover Behavior:
+  - Primary gets all traffic when healthy
+  - If primary fails health checks, traffic switches to backup
+  - Returns to primary when it recovers
+  - Health checked from multiple regions
+
+To view/edit: https://dash.cloudflare.com/$(echo "$CF_ZONE_ID" | cut -c1-8)/traffic/load-balancing
 EOF
 
+  echo "Configuration saved to: ${CONFIG_DIR}/lb_${rand}_*.info"
+  echo "CNAME endpoint saved to: $LAST_LB_FILE"
   echo
+
   read -rp "Press Enter to exit..." _
 }
 
