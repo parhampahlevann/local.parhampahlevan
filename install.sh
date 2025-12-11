@@ -5,7 +5,7 @@
 # - Tests Cloudflare access
 # - Asks for two IPv4 addresses
 # - Creates srv-xxxx.BASE_HOST with two A records
-# - Prints final CNAME target for you to use
+# - Prints final CNAME target for you to use, and saves it to last_cname.txt
 
 set -euo pipefail
 
@@ -13,6 +13,7 @@ TOOL_NAME="cf-multi-ip-cname"
 CONFIG_DIR="$HOME/.${TOOL_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config"
 LOG_FILE="${CONFIG_DIR}/created_hosts.log"
+LAST_CNAME_FILE="${CONFIG_DIR}/last_cname.txt"
 
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
@@ -246,6 +247,7 @@ main_flow() {
     exit 1
   fi
 
+  # 4) print and save final CNAME target
   echo
   echo "==============================================="
   echo "✅ DONE!"
@@ -262,6 +264,13 @@ main_flow() {
   echo "   $full_name"
   echo "==============================================="
   echo
+
+  echo "$full_name" > "$LAST_CNAME_FILE"
+  echo "Last CNAME target has been saved to:"
+  echo "   $LAST_CNAME_FILE"
+  echo
+
+  read -rp "Press Enter to exit..." _
 }
 
 # ===================== Entry point =====================
