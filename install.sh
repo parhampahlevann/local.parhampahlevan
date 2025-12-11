@@ -16,12 +16,8 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 # These will be loaded from config file if it exists
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-
-# Base host is fixed (you can edit this line if needed)
-BASE_HOST="mydns.cam"
-
-# Cloudflare proxy: always OFF by default for created records
-CF_PROXY="false"   # "true" or "false"
+BASE_HOST=""     # e.g. "cloudmahann.ir"
+CF_PROXY="false" # Cloudflare proxy always OFF for created records
 
 # ===================== Helpers =====================
 
@@ -68,6 +64,7 @@ save_config() {
 # Auto-generated config for $TOOL_NAME
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
+BASE_HOST="$BASE_HOST"
 CF_PROXY="$CF_PROXY"
 EOF
   echo "Config saved to $CONFIG_FILE"
@@ -100,7 +97,7 @@ test_config() {
   zone_name=$(echo "$resp" | jq -r '.result.name')
   echo "✅ Cloudflare zone name: $zone_name"
 
-  if [[ "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
+  if [[ -n "$BASE_HOST" && "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
     echo "⚠️ WARNING:"
     echo "  BASE_HOST is not equal to the zone name or a subdomain of it."
     echo "  Zone name  : $zone_name"
@@ -117,12 +114,10 @@ configure_cloudflare() {
   echo "=== Cloudflare configuration ==="
   read -rp "Enter Cloudflare API Token: " CF_API_TOKEN
   read -rp "Enter Cloudflare Zone ID: " CF_ZONE_ID
+  read -rp "Enter base hostname (e.g. cloudmahann.ir or nodes.cloudmahann.ir): " BASE_HOST
 
-  # Force defaults
-  BASE_HOST="mydns.cam"
+  # Force proxy OFF (DNS only)
   CF_PROXY="false"
-
-  echo "Base hostname automatically set to: $BASE_HOST"
   echo "Cloudflare proxy disabled on all created records (proxied = false)."
 
   ensure_dir
@@ -131,7 +126,7 @@ configure_cloudflare() {
 }
 
 require_config() {
-  if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" ]]; then
+  if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" || -z "${BASE_HOST:-}" ]]; then
     echo "Cloudflare not fully configured yet."
     echo "Please configure it first."
     pause
