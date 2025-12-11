@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Simple Cloudflare multi-IP hostname helper
-# Creates a random hostname with two A records and lets you delete them later.
+# One-shot Cloudflare multi-IP hostname helper
+# - Installs prerequisites (curl, jq)
+# - Asks for CF API token / Zone ID / BASE_HOST once and saves them
+# - Tests Cloudflare access
+# - Asks for two IPv4 addresses
+# - Creates srv-xxxx.BASE_HOST with two A records
+# - Prints final CNAME target for you to use
 
 set -euo pipefail
-
-# ===================== Paths & Globals =====================
 
 TOOL_NAME="cf-multi-ip-cname"
 CONFIG_DIR="$HOME/.${TOOL_NAME}"
@@ -13,13 +16,10 @@ LOG_FILE="${CONFIG_DIR}/created_hosts.log"
 
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
-# These will be loaded from config file if it exists
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-BASE_HOST=""     # e.g. "cloudmahann.ir"
-CF_PROXY="false" # Cloudflare proxy always OFF for created records
-
-# ===================== Helpers =====================
+BASE_HOST=""
+CF_PROXY="false"   # always DNS-only (proxy off)
 
 pause() {
   read -rp "Press Enter to continue..." _
@@ -31,25 +31,26 @@ ensure_dir() {
 }
 
 install_prereqs() {
-  echo "Checking prerequisites..."
+  echo "==> Checking prerequisites..."
 
   if ! command -v curl >/dev/null 2>&1; then
-    echo "curl not found. Installing curl (requires sudo)..."
+    echo "   curl not found. Installing curl (requires sudo)..."
     sudo apt-get update
     sudo apt-get install -y curl
   else
-    echo "curl is already installed."
+    echo "   curl is already installed."
   fi
 
   if ! command -v jq >/dev/null 2>&1; then
-    echo "jq not found. Installing jq (requires sudo)..."
+    echo "   jq not found. Installing jq (requires sudo)..."
     sudo apt-get update
     sudo apt-get install -y jq
   else
-    echo "jq is already installed."
+    echo "   jq is already installed."
   fi
 
-  echo "Prerequisites are ready."
+  echo "==> Prerequisites are ready."
+  echo
 }
 
 load_config() {
@@ -67,7 +68,8 @@ CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 CF_PROXY="$CF_PROXY"
 EOF
-  echo "Config saved to $CONFIG_FILE"
+  echo "==> Config saved to $CONFIG_FILE"
+  echo
 }
 
 api_get() {
@@ -80,17 +82,18 @@ api_get() {
 }
 
 test_config() {
-  echo "Testing Cloudflare zone ID and API token..."
+  echo "==> Testing Cloudflare Zone ID and API token..."
   local url resp success zone_name
   url="${CF_API_BASE}/zones/${CF_ZONE_ID}"
-  resp=$(api_get "$url")
-  success=$(echo "$resp" | jq -r '.success // false')
+  resp=$(api_get "$url" || true)
+
+  success=$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo "false")
 
   if [[ "$success" != "true" ]]; then
     echo "❌ Failed to fetch zone details from Cloudflare:"
-    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"'
-    echo "Please make sure the API token and Zone ID are correct."
-    pause
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
+    echo
+    echo "Please check your API token and Zone ID."
     return 1
   fi
 
@@ -99,38 +102,37 @@ test_config() {
 
   if [[ -n "$BASE_HOST" && "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
     echo "⚠️ WARNING:"
-    echo "  BASE_HOST is not equal to the zone name or a subdomain of it."
-    echo "  Zone name  : $zone_name"
-    echo "  BASE_HOST  : $BASE_HOST"
-    echo "  DNS records will only work correctly if BASE_HOST is the zone or its subdomain."
-    echo "  Example for this zone: $zone_name or nodes.$zone_name"
+    echo "   BASE_HOST is not equal to the zone name or a subdomain of it."
+    echo "   Zone name : $zone_name"
+    echo "   BASE_HOST : $BASE_HOST"
+    echo "   Records will only work correctly if BASE_HOST is the zone or its subdomain."
+    echo "   Example for this zone: $zone_name or nodes.$zone_name"
   fi
-
-  pause
+  echo
   return 0
 }
 
-configure_cloudflare() {
-  echo "=== Cloudflare configuration ==="
+configure_if_needed() {
+  if [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" && -n "${BASE_HOST:-}" ]]; then
+    # already configured
+    return
+  fi
+
+  echo "=== First-time Cloudflare configuration ==="
   read -rp "Enter Cloudflare API Token: " CF_API_TOKEN
   read -rp "Enter Cloudflare Zone ID: " CF_ZONE_ID
   read -rp "Enter base hostname (e.g. cloudmahann.ir or nodes.cloudmahann.ir): " BASE_HOST
 
-  # Force proxy OFF (DNS only)
-  CF_PROXY="false"
-  echo "Cloudflare proxy disabled on all created records (proxied = false)."
+  CF_PROXY="false"   # always DNS only
+  echo "Cloudflare proxy is disabled on created records (proxied = false)."
+  echo
 
   ensure_dir
   save_config
-  test_config || echo "Config test failed; you can reconfigure from the menu."
-}
 
-require_config() {
-  if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" || -z "${BASE_HOST:-}" ]]; then
-    echo "Cloudflare not fully configured yet."
-    echo "Please configure it first."
-    pause
-    configure_cloudflare
+  if ! test_config; then
+    echo "❌ Config test failed. Fix API token / Zone ID / BASE_HOST and run again."
+    exit 1
   fi
 }
 
@@ -146,7 +148,6 @@ valid_ipv4() {
 }
 
 random_subdomain() {
-  # 8 characters a-z0-9
   tr -dc 'a-z0-9' </dev/urandom | head -c 8
 }
 
@@ -158,13 +159,6 @@ api_post() {
     -H "Authorization: Bearer $CF_API_TOKEN" \
     -H "Content-Type: application/json" \
     --data "$data"
-}
-
-api_delete() {
-  local url="$1"
-  curl -sS -X DELETE "$url" \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
-    -H "Content-Type: application/json"
 }
 
 create_a_record() {
@@ -185,198 +179,89 @@ EOF
 
   local url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records"
   local resp
-  resp=$(api_post "$url" "$data")
+  resp=$(api_post "$url" "$data" || true)
 
   local success
-  success=$(echo "$resp" | jq -r '.success // false')
+  success=$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo "false")
 
   if [[ "$success" != "true" ]]; then
     echo "❌ Cloudflare error while creating A record for $name ($ip):"
-    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"'
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"' 2>/dev/null || echo "$resp"
     return 1
   fi
 
   local rec_id
   rec_id=$(echo "$resp" | jq -r '.result.id')
-  echo "Created A record id: $rec_id for $name -> $ip"
+  echo "   Created A record id: $rec_id for $name -> $ip"
   echo "$(date +'%Y-%m-%d %H:%M:%S') CREATE $name A $ip $rec_id" >> "$LOG_FILE"
   return 0
 }
 
-create_hostname_with_two_ips() {
-  require_config
+main_flow() {
+  echo "=== Cloudflare multi-IP hostname creator ==="
+  echo
 
-  echo "=== Create hostname with two IPv4 addresses ==="
-  echo "Base host: $BASE_HOST"
-  read -rp "Enter first IPv4: " ip1
-  read -rp "Enter second IPv4: " ip2
+  # 1) make sure config exists
+  configure_if_needed
 
-  if ! valid_ipv4 "$ip1" || ! valid_ipv4 "$ip2"; then
-    echo "❌ One or both IPs are invalid. Please try again."
-    pause
-    return
-  fi
+  echo "Using configuration:"
+  echo "  BASE_HOST : $BASE_HOST"
+  echo "  CF_ZONE_ID: $CF_ZONE_ID"
+  echo
 
+  # 2) ask for two IPv4 addresses
+  local ip1 ip2
+  while true; do
+    read -rp "Enter first IPv4: " ip1
+    read -rp "Enter second IPv4: " ip2
+
+    if valid_ipv4 "$ip1" && valid_ipv4 "$ip2"; then
+      break
+    fi
+    echo "❌ One or both IPs are invalid. Please enter two valid IPv4 addresses."
+  done
+
+  # 3) generate hostname
   local rand sub full_name
   rand=$(random_subdomain)
   sub="srv-${rand}"
   full_name="${sub}.${BASE_HOST}"
 
   echo
-  echo "Creating hostname: $full_name"
-  echo "Using IPs: $ip1 and $ip2"
+  echo "==> Creating hostname on Cloudflare:"
+  echo "    Hostname: $full_name"
+  echo "    IPs     : $ip1 , $ip2"
   echo
 
-  echo "Creating first A record..."
+  echo "   Creating first A record..."
   if ! create_a_record "$full_name" "$ip1"; then
-    echo "Failed to create first A record. Aborting."
-    pause
-    return
+    echo "❌ Failed to create first A record. Aborting."
+    exit 1
   fi
 
-  echo "Creating second A record..."
+  echo "   Creating second A record..."
   if ! create_a_record "$full_name" "$ip2"; then
-    echo "Failed to create second A record."
-    echo "Note: the first A record was already created; you might want to delete it."
-    pause
-    return
+    echo "❌ Failed to create second A record."
+    echo "Note: the first A record was already created; you may want to delete it manually."
+    exit 1
   fi
 
   echo
-  echo "======================================="
-  echo "✅ Hostname created successfully:"
-  echo "  $full_name"
+  echo "==============================================="
+  echo "✅ DONE!"
   echo
-  echo "You can now use it as a CNAME target in other domains, for example:"
-  echo "  app.yourdomain.com    CNAME    $full_name"
+  echo "Your CNAME target (hostname with both IPs) is:"
   echo
-  echo "All traffic to that CNAME will be resolved to:"
-  echo "  $ip1"
-  echo "  $ip2"
-  echo "======================================="
+  echo "   $full_name"
   echo
-  pause
-}
-
-delete_hostname_records() {
-  require_config
-
-  echo "=== Delete all DNS records for a hostname (in this zone) ==="
-  echo "Base host: $BASE_HOST"
-  read -rp "Enter hostname to delete (e.g. srv-xxxx.${BASE_HOST}): " host
-
-  if [[ -z "$host" ]]; then
-    echo "Hostname cannot be empty."
-    pause
-    return
-  fi
-
-  local url resp count
-  url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records"
-  echo "Looking up DNS records for: $host"
-  resp=$(api_get "$url" --data-urlencode "name=$host")
-  count=$(echo "$resp" | jq -r '.result | length')
-
-  if [[ "$count" -eq 0 ]]; then
-    echo "No DNS records found for $host in this zone."
-    pause
-    return
-  fi
-
-  echo "Found $count record(s):"
-  echo "$resp" | jq -r '.result[] | "- ID: \(.id) | Type: \(.type) | Name: \(.name) | Content: \(.content)"'
+  echo "You can use it like this in any other domain:"
   echo
-
-  read -rp "Delete ALL of these records? [y/N]: " ans
-  ans="${ans:-n}"
-  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    pause
-    return
-  fi
-
-  local id
-  while read -r id; do
-    [[ -z "$id" || "$id" == "null" ]] && continue
-    local del_url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records/${id}"
-    local dresp dsuccess
-    dresp=$(api_delete "$del_url")
-    dsuccess=$(echo "$dresp" | jq -r '.success // false')
-    if [[ "$dsuccess" == "true" ]]; then
-      echo "Deleted record id: $id"
-      echo "$(date +'%Y-%m-%d %H:%M:%S') DELETE $host $id" >> "$LOG_FILE"
-    else
-      echo "Failed to delete record id: $id"
-      echo "$dresp" | jq -r '.errors[]? | "- \(.code): \(.message)"'
-    fi
-  done < <(echo "$resp" | jq -r '.result[]?.id')
-
-  echo "Done."
-  pause
-}
-
-show_log() {
-  ensure_dir
-  echo "=== Created/Deleted records log ==="
-  if [[ ! -s "$LOG_FILE" ]]; then
-    echo "Log is empty."
-  else
-    cat "$LOG_FILE"
-  fi
+  echo "   mysub.yourdomain.com    CNAME    $full_name"
   echo
-  pause
-}
-
-uninstall_tool() {
-  echo "=== Uninstall $TOOL_NAME ==="
-  echo "This will remove:"
-  echo "  - Config directory: $CONFIG_DIR"
-  echo "  - Log file: $LOG_FILE"
-  echo "It will NOT remove curl/jq or any DNS records on Cloudflare."
+  echo "Both IPs $ip1 and $ip2 are now attached to:"
+  echo "   $full_name"
+  echo "==============================================="
   echo
-  read -rp "Are you sure you want to uninstall? [y/N]: " ans
-  ans="${ans:-n}"
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
-    rm -rf "$CONFIG_DIR"
-    echo "Config and logs removed."
-    echo "You can now delete this script file (install.sh) manually if you want."
-    exit 0
-  else
-    echo "Uninstall cancelled."
-    pause
-  fi
-}
-
-main_menu() {
-  while true; do
-    clear
-    echo "============================================"
-    echo "  $TOOL_NAME - Cloudflare Multi-IP Hostname "
-    echo "============================================"
-    echo "Config:"
-    echo "  BASE_HOST   : ${BASE_HOST:-<not set>}"
-    echo "  CF_ZONE_ID  : ${CF_ZONE_ID:-<not set>}"
-    echo "  CF_PROXY    : ${CF_PROXY:-<not set>}"
-    echo "--------------------------------------------"
-    echo "1) Configure / Change Cloudflare settings"
-    echo "2) Create hostname with two IPv4 addresses"
-    echo "3) Delete all DNS records for a hostname"
-    echo "4) Show log of created/deleted records"
-    echo "5) Uninstall this tool (remove config & logs)"
-    echo "0) Exit"
-    echo "--------------------------------------------"
-    read -rp "Choose an option: " choice
-
-    case "$choice" in
-      1) configure_cloudflare ;;
-      2) create_hostname_with_two_ips ;;
-      3) delete_hostname_records ;;
-      4) show_log ;;
-      5) uninstall_tool ;;
-      0) echo "Bye!"; exit 0 ;;
-      *) echo "Invalid option."; pause ;;
-    esac
-  done
 }
 
 # ===================== Entry point =====================
@@ -384,4 +269,4 @@ main_menu() {
 ensure_dir
 install_prereqs
 load_config
-main_menu
+main_flow
