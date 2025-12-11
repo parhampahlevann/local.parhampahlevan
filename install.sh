@@ -16,7 +16,7 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 # These will be loaded from config file if it exists
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-BASE_HOST=""
+BASE_HOST=""   # e.g. "mydns.cam"
 CF_PROXY="true"   # "true" or "false" (Cloudflare orange-cloud on/off)
 
 # ===================== Helpers =====================
@@ -70,11 +70,50 @@ EOF
   echo "Config saved to $CONFIG_FILE"
 }
 
+api_get() {
+  local url="$1"
+  shift || true
+  curl -sS -G "$url" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    "$@"
+}
+
+test_config() {
+  echo "Testing Cloudflare Zone ID and API token..."
+  local url resp success zone_name
+  url="${CF_API_BASE}/zones/${CF_ZONE_ID}"
+  resp=$(api_get "$url")
+  success=$(echo "$resp" | jq -r '.success // false')
+
+  if [[ "$success" != "true" ]]; then
+    echo "❌ Failed to fetch zone details from Cloudflare:"
+    echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"'
+    echo "Please make sure the API token and Zone ID are correct."
+    pause
+    return 1
+  fi
+
+  zone_name=$(echo "$resp" | jq -r '.result.name')
+  echo "✅ Cloudflare zone name: $zone_name"
+
+  if [[ -n "$BASE_HOST" && "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
+    echo "⚠️ WARNING:"
+    echo "  BASE_HOST is not equal to the zone name or a subdomain of it."
+    echo "  Zone name  : $zone_name"
+    echo "  BASE_HOST  : $BASE_HOST"
+    echo "  DNS records will only work correctly if BASE_HOST is the zone or a subdomain of it."
+    echo "  Example for this zone: $zone_name or something like nodes.$zone_name"
+  fi
+  pause
+  return 0
+}
+
 configure_cloudflare() {
   echo "=== Cloudflare configuration ==="
   read -rp "Enter Cloudflare API Token: " CF_API_TOKEN
   read -rp "Enter Cloudflare Zone ID: " CF_ZONE_ID
-  read -rp "Enter base hostname (e.g. example.com or nodes.example.com): " BASE_HOST
+  read -rp "Enter base hostname (e.g. mydns.cam or nodes.mydns.cam): " BASE_HOST
 
   local proxy_choice
   read -rp "Use Cloudflare proxy (orange cloud)? [y/n] (default: y): " proxy_choice
@@ -87,13 +126,12 @@ configure_cloudflare() {
 
   ensure_dir
   save_config
-  echo "Cloudflare settings updated."
-  pause
+  test_config || echo "Config test failed; you can reconfigure from the menu."
 }
 
 require_config() {
   if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" || -z "${BASE_HOST:-}" ]]; then
-    echo "Cloudflare not configured yet."
+    echo "Cloudflare not fully configured yet."
     echo "Please configure it first."
     pause
     configure_cloudflare
@@ -124,15 +162,6 @@ api_post() {
     -H "Authorization: Bearer $CF_API_TOKEN" \
     -H "Content-Type: application/json" \
     --data "$data"
-}
-
-api_get() {
-  local url="$1"
-  shift
-  curl -sS -G "$url" \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
-    -H "Content-Type: application/json" \
-    "$@"
 }
 
 api_delete() {
@@ -166,7 +195,7 @@ EOF
   success=$(echo "$resp" | jq -r '.success // false')
 
   if [[ "$success" != "true" ]]; then
-    echo "Cloudflare error while creating A record for $name ($ip):"
+    echo "❌ Cloudflare error while creating A record for $name ($ip):"
     echo "$resp" | jq -r '.errors[]? | "- \(.code): \(.message)"'
     return 1
   fi
@@ -182,11 +211,12 @@ create_hostname_with_two_ips() {
   require_config
 
   echo "=== Create hostname with two IPv4 addresses ==="
+  echo "Base host: $BASE_HOST"
   read -rp "Enter first IPv4: " ip1
   read -rp "Enter second IPv4: " ip2
 
   if ! valid_ipv4 "$ip1" || ! valid_ipv4 "$ip2"; then
-    echo "One or both IPs are invalid. Please try again."
+    echo "❌ One or both IPs are invalid. Please try again."
     pause
     return
   fi
@@ -196,6 +226,7 @@ create_hostname_with_two_ips() {
   sub="srv-${rand}"
   full_name="${sub}.${BASE_HOST}"
 
+  echo
   echo "Creating hostname: $full_name"
   echo "Using IPs: $ip1 and $ip2"
   echo
@@ -222,6 +253,10 @@ create_hostname_with_two_ips() {
   echo
   echo "You can now use it as a CNAME target in other domains, for example:"
   echo "  app.yourdomain.com    CNAME    $full_name"
+  echo
+  echo "All traffic to that CNAME will be resolved to:"
+  echo "  $ip1"
+  echo "  $ip2"
   echo "======================================="
   echo
   pause
@@ -231,6 +266,7 @@ delete_hostname_records() {
   require_config
 
   echo "=== Delete all DNS records for a hostname (in this zone) ==="
+  echo "Base host: $BASE_HOST"
   read -rp "Enter hostname to delete (e.g. srv-xxxx.${BASE_HOST}): " host
 
   if [[ -z "$host" ]]; then
@@ -239,9 +275,9 @@ delete_hostname_records() {
     return
   fi
 
-  echo "Looking up DNS records for: $host"
   local url resp count
   url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records"
+  echo "Looking up DNS records for: $host"
   resp=$(api_get "$url" --data-urlencode "name=$host")
   count=$(echo "$resp" | jq -r '.result | length')
 
@@ -267,9 +303,8 @@ delete_hostname_records() {
   while read -r id; do
     [[ -z "$id" || "$id" == "null" ]] && continue
     local del_url="${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records/${id}"
-    local dresp
+    local dresp dsuccess
     dresp=$(api_delete "$del_url")
-    local dsuccess
     dsuccess=$(echo "$dresp" | jq -r '.success // false')
     if [[ "$dsuccess" == "true" ]]; then
       echo "Deleted record id: $id"
