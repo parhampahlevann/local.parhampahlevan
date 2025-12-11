@@ -16,8 +16,12 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 # These will be loaded from config file if it exists
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-BASE_HOST=""   # e.g. "mydns.cam"
-CF_PROXY="true"   # "true" or "false" (Cloudflare orange-cloud on/off)
+
+# Base host is fixed (you can edit this line if needed)
+BASE_HOST="mydns.cam"
+
+# Cloudflare proxy: always OFF by default for created records
+CF_PROXY="false"   # "true" or "false"
 
 # ===================== Helpers =====================
 
@@ -64,7 +68,6 @@ save_config() {
 # Auto-generated config for $TOOL_NAME
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
-BASE_HOST="$BASE_HOST"
 CF_PROXY="$CF_PROXY"
 EOF
   echo "Config saved to $CONFIG_FILE"
@@ -80,7 +83,7 @@ api_get() {
 }
 
 test_config() {
-  echo "Testing Cloudflare Zone ID and API token..."
+  echo "Testing Cloudflare zone ID and API token..."
   local url resp success zone_name
   url="${CF_API_BASE}/zones/${CF_ZONE_ID}"
   resp=$(api_get "$url")
@@ -97,14 +100,15 @@ test_config() {
   zone_name=$(echo "$resp" | jq -r '.result.name')
   echo "✅ Cloudflare zone name: $zone_name"
 
-  if [[ -n "$BASE_HOST" && "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
+  if [[ "$BASE_HOST" != "$zone_name" && "$BASE_HOST" != *".${zone_name}" ]]; then
     echo "⚠️ WARNING:"
     echo "  BASE_HOST is not equal to the zone name or a subdomain of it."
     echo "  Zone name  : $zone_name"
     echo "  BASE_HOST  : $BASE_HOST"
-    echo "  DNS records will only work correctly if BASE_HOST is the zone or a subdomain of it."
-    echo "  Example for this zone: $zone_name or something like nodes.$zone_name"
+    echo "  DNS records will only work correctly if BASE_HOST is the zone or its subdomain."
+    echo "  Example for this zone: $zone_name or nodes.$zone_name"
   fi
+
   pause
   return 0
 }
@@ -113,16 +117,13 @@ configure_cloudflare() {
   echo "=== Cloudflare configuration ==="
   read -rp "Enter Cloudflare API Token: " CF_API_TOKEN
   read -rp "Enter Cloudflare Zone ID: " CF_ZONE_ID
-  read -rp "Enter base hostname (e.g. mydns.cam or nodes.mydns.cam): " BASE_HOST
 
-  local proxy_choice
-  read -rp "Use Cloudflare proxy (orange cloud)? [y/n] (default: y): " proxy_choice
-  proxy_choice="${proxy_choice:-y}"
-  if [[ "$proxy_choice" =~ ^[Yy]$ ]]; then
-    CF_PROXY="true"
-  else
-    CF_PROXY="false"
-  fi
+  # Force defaults
+  BASE_HOST="mydns.cam"
+  CF_PROXY="false"
+
+  echo "Base hostname automatically set to: $BASE_HOST"
+  echo "Cloudflare proxy disabled on all created records (proxied = false)."
 
   ensure_dir
   save_config
@@ -130,7 +131,7 @@ configure_cloudflare() {
 }
 
 require_config() {
-  if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" || -z "${BASE_HOST:-}" ]]; then
+  if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE_ID:-}" ]]; then
     echo "Cloudflare not fully configured yet."
     echo "Please configure it first."
     pause
