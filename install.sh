@@ -21,10 +21,30 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
-# Monitor Settings
-CHECK_INTERVAL=5        # Check every 5 seconds
-FAILURE_THRESHOLD=2     # 2 failures = 10 seconds total
-RECOVERY_THRESHOLD=3    # 3 successful checks = 15 seconds
+# =============================================
+# MONITORING PARAMETERS (TUNABLE - MATCHING SCRIPT 1)
+# =============================================
+
+CHECK_INTERVAL=2          # Check every 2 seconds (like script 1)
+PING_COUNT=3              # 3 pings per check (like script 1)
+PING_TIMEOUT=1            # 1 second timeout per ping (like script 1)
+
+# When is a server considered DOWN?
+HARD_DOWN_LOSS=90         # >= 90% loss = DOWN (like script 1)
+
+# When to switch to backup (degraded condition)
+DEGRADED_LOSS=40          # >= 40% loss = degraded (like script 1)
+DEGRADED_RTT=300          # >= 300ms RTT = degraded (like script 1)
+BAD_STREAK_LIMIT=3        # 3 consecutive degraded checks before switching (like script 1)
+
+# When to switch back to primary (recovery condition)
+PRIMARY_OK_LOSS=50        # loss <= 50% (like script 1)
+PRIMARY_OK_RTT=450        # RTT <= 450ms (like script 1)
+PRIMARY_STABLE_ROUNDS=3   # 3 consecutive good checks (6 seconds total) (like script 1)
+
+# Failure thresholds (calculated based on CHECK_INTERVAL)
+FAILURE_THRESHOLD=2       # 2 failures before failover (4 seconds total)
+RECOVERY_THRESHOLD=3      # 3 good checks before recovery (6 seconds total)
 
 # Colors
 RED='\033[0;31m'
@@ -103,7 +123,9 @@ check_prerequisites() {
     
     # Check ping
     if ! command -v ping &>/dev/null; then
-        log "ping is not installed" "WARNING"
+        log "ping is not installed" "ERROR"
+        echo "Install with: sudo apt-get install iputils-ping"
+        missing=1
     fi
     
     if [ $missing -eq 1 ]; then
@@ -345,6 +367,79 @@ validate_ip() {
 }
 
 # =============================================
+# HEALTH CHECK FUNCTIONS (LIKE SCRIPT 1)
+# =============================================
+
+check_ip_health_detailed() {
+    local ip="$1"
+    
+    local ping_output
+    local loss=100
+    local rtt=1000
+    
+    ping_output=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ip" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]]; then
+        # Extract packet loss
+        local loss_line
+        loss_line=$(echo "$ping_output" | grep -m1 "packet loss")
+        if [[ -n "$loss_line" ]]; then
+            loss=$(echo "$loss_line" | awk -F',' '{print $3}' | sed 's/[^0-9]//g')
+            [[ -z "$loss" ]] && loss=0
+        else
+            loss=0
+        fi
+        
+        # Extract RTT
+        local rtt_line
+        rtt_line=$(echo "$ping_output" | grep -m1 "rtt" || true)
+        if [[ -n "$rtt_line" ]]; then
+            rtt=$(echo "$rtt_line" | awk -F'/' '{print $5}')
+            rtt=${rtt%.*}
+            [[ -z "$rtt" ]] && rtt=0
+        else
+            rtt=50
+        fi
+    else
+        # Ping failed
+        loss=100
+        rtt=1000
+    fi
+    
+    echo "$loss $rtt"
+}
+
+compute_score() {
+    local loss="$1"
+    local rtt="$2"
+    # Lower score = better (like script 1)
+    echo $(( loss * 100 + rtt ))
+}
+
+check_ip_basic() {
+    local ip="$1"
+    
+    # Simple check for basic connectivity
+    if ping -c 1 -W 1 "$ip" &>/dev/null; then
+        return 0
+    fi
+    
+    # Fallback: try curl on port 80
+    if curl -s --max-time 2 "http://$ip" &>/dev/null; then
+        return 0
+    fi
+    
+    # Try netcat on port 80
+    if command -v nc &>/dev/null; then
+        if nc -z -w 1 "$ip" 80 &>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# =============================================
 # DNS MANAGEMENT
 # =============================================
 
@@ -543,8 +638,11 @@ setup_dual_ip() {
     echo "  Backup:  $backup_host → $backup_ip"
     echo "  CNAME:   $cname → $primary_host"
     echo
-    echo "Auto-Failover Settings:"
+    echo "Auto-Failover Settings (like Script 1):"
     echo "  Check interval: ${CHECK_INTERVAL} seconds"
+    echo "  Ping count: ${PING_COUNT} per check"
+    echo "  Degraded threshold: ${DEGRADED_LOSS}% loss or ${DEGRADED_RTT}ms RTT"
+    echo "  Hard down threshold: ${HARD_DOWN_LOSS}% loss"
     echo "  Failover after: $((CHECK_INTERVAL * FAILURE_THRESHOLD)) seconds"
     echo "  Recovery after: $((CHECK_INTERVAL * RECOVERY_THRESHOLD)) seconds"
     echo
@@ -556,61 +654,19 @@ setup_dual_ip() {
 }
 
 # =============================================
-# MONITORING FUNCTIONS
+# ENHANCED MONITORING FUNCTIONS (LIKE SCRIPT 1)
 # =============================================
 
-check_ip_health() {
-    local ip="$1"
-    
-    # Try ping first
-    if command -v ping &>/dev/null; then
-        if ping -c 1 -W 1 "$ip" &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
-    
-    # Fallback: try curl on port 80
-    if command -v curl &>/dev/null; then
-        if curl -s --max-time 2 "http://$ip" &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
-    
-    # Try netcat on port 80
-    if command -v nc &>/dev/null; then
-        if nc -z -w 1 "$ip" 80 &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
-    
-    return 1  # All checks failed
-}
-
 perform_failover() {
-    local state
-    state=$(load_state)
-    
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    local backup_host
-    backup_host=$(echo "$state" | jq -r '.backup_host // empty')
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found for failover" "ERROR"
-        return 1
-    fi
+    local cname="$1"
+    local backup_host="$2"
+    local primary_ip="$3"
+    local backup_ip="$4"
     
     log "Primary IP ($primary_ip) is down! Initiating failover..." "WARNING"
     log "Switching CNAME to backup: $cname → $backup_host" "INFO"
     
     if update_cname_target "$cname" "$backup_host"; then
-        update_state "active_ip" "$backup_ip"
-        update_state "failure_count" "0"
-        update_state "recovery_count" "0"
         log "Failover completed! Now using Backup IP ($backup_ip)" "SUCCESS"
         return 0
     else
@@ -620,30 +676,15 @@ perform_failover() {
 }
 
 perform_recovery() {
-    local state
-    state=$(load_state)
-    
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    local primary_host
-    primary_host=$(echo "$state" | jq -r '.primary_host // empty')
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found for recovery" "ERROR"
-        return 1
-    fi
+    local cname="$1"
+    local primary_host="$2"
+    local primary_ip="$3"
+    local backup_ip="$4"
     
     log "Primary IP ($primary_ip) is healthy again! Switching back..." "INFO"
     log "Switching CNAME to primary: $cname → $primary_host" "INFO"
     
     if update_cname_target "$cname" "$primary_host"; then
-        update_state "active_ip" "$primary_ip"
-        update_state "failure_count" "0"
-        update_state "recovery_count" "0"
         log "Recovery completed! Now using Primary IP ($primary_ip)" "SUCCESS"
         return 0
     else
@@ -652,8 +693,8 @@ perform_recovery() {
     fi
 }
 
-monitor_service() {
-    log "Starting auto-monitor service..." "INFO"
+monitor_service_enhanced() {
+    log "Starting enhanced auto-monitor service (like Script 1)..." "INFO"
     log "Monitoring interval: ${CHECK_INTERVAL} seconds" "INFO"
     
     # Load initial state
@@ -662,6 +703,14 @@ monitor_service() {
     
     local cname
     cname=$(echo "$state" | jq -r '.cname // empty')
+    local primary_ip
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    local backup_ip
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    local primary_host
+    primary_host=$(echo "$state" | jq -r '.primary_host // empty')
+    local backup_host
+    backup_host=$(echo "$state" | jq -r '.backup_host // empty')
     
     if [ -z "$cname" ]; then
         log "No setup found. Please run setup first." "ERROR"
@@ -671,64 +720,146 @@ monitor_service() {
     # Save PID
     echo $$ > "$MONITOR_PID_FILE"
     
-    log "Auto-monitor service started (PID: $$)" "SUCCESS"
+    log "Enhanced monitor service started (PID: $$)" "SUCCESS"
     log "Press Ctrl+C to stop monitoring" "INFO"
     
     # Trap signals
     trap 'log "Monitor service stopped" "INFO"; rm -f "$MONITOR_PID_FILE"; exit 0' INT TERM
     
+    # State variables (like script 1)
+    local CURRENT_IP="$primary_ip"
+    local CURRENT_BAD_STREAK=0
+    local PRIMARY_GOOD_STREAK=0
+    local FAILURE_COUNT=0
+    local RECOVERY_COUNT=0
+    
     # Main monitoring loop
     while true; do
-        state=$(load_state)
+        # Check primary IP health with detailed metrics (like script 1)
+        local primary_check
+        primary_check=$(check_ip_health_detailed "$primary_ip")
+        local primary_loss
+        primary_loss=$(echo "$primary_check" | awk '{print $1}')
+        local primary_rtt
+        primary_rtt=$(echo "$primary_check" | awk '{print $2}')
+        local primary_score
+        primary_score=$(compute_score "$primary_loss" "$primary_rtt")
         
-        local primary_ip
-        primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-        local backup_ip
-        backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-        local active_ip
-        active_ip=$(echo "$state" | jq -r '.active_ip // empty')
-        local failure_count
-        failure_count=$(echo "$state" | jq -r '.failure_count // 0')
-        local recovery_count
-        recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
+        # Check backup IP health with detailed metrics (like script 1)
+        local backup_check
+        backup_check=$(check_ip_health_detailed "$backup_ip")
+        local backup_loss
+        backup_loss=$(echo "$backup_check" | awk '{print $1}')
+        local backup_rtt
+        backup_rtt=$(echo "$backup_check" | awk '{print $2}')
+        local backup_score
+        backup_score=$(compute_score "$backup_loss" "$backup_rtt")
         
-        # Check primary IP health
-        if check_ip_health "$primary_ip"; then
-            # Primary is healthy
-            update_state "failure_count" "0"
-            
-            # If currently on backup and primary is healthy, start recovery count
-            if [ "$active_ip" = "$backup_ip" ]; then
-                local new_recovery_count=$((recovery_count + 1))
-                update_state "recovery_count" "$new_recovery_count"
-                
-                log "Primary IP ($primary_ip) is healthy. Recovery count: $new_recovery_count/$RECOVERY_THRESHOLD" "INFO"
-                
-                # Check if we should switch back to primary
-                if [ "$new_recovery_count" -ge "$RECOVERY_THRESHOLD" ]; then
-                    perform_recovery
-                fi
-            else
-                # Reset recovery count if already on primary
-                update_state "recovery_count" "0"
-            fi
+        # Log health status
+        log "Primary: loss=${primary_loss}% rtt=${primary_rtt}ms score=$primary_score | Backup: loss=${backup_loss}% rtt=${backup_rtt}ms score=$backup_score" "INFO"
+        
+        # Track primary stability (برای برگشت روی سرور اصلی - like script 1)
+        if (( primary_loss <= PRIMARY_OK_LOSS && primary_rtt <= PRIMARY_OK_RTT )); then
+            PRIMARY_GOOD_STREAK=$((PRIMARY_GOOD_STREAK + 1))
+            log "Primary good streak: $PRIMARY_GOOD_STREAK/$PRIMARY_STABLE_ROUNDS" "INFO"
         else
-            # Primary is down
-            local new_failure_count=$((failure_count + 1))
-            update_state "failure_count" "$new_failure_count"
-            
-            log "Primary IP ($primary_ip) is down. Failure count: $new_failure_count/$FAILURE_THRESHOLD" "WARNING"
-            
-            # Check if we should switch to backup
-            if [ "$new_failure_count" -ge "$FAILURE_THRESHOLD" ] && [ "$active_ip" = "$primary_ip" ]; then
-                perform_failover
-            fi
-            
-            # Reset recovery count when primary is down
-            update_state "recovery_count" "0"
+            PRIMARY_GOOD_STREAK=0
         fi
         
-        # Sleep before next check
+        # Track current degradation (برای رفتن روی بکاپ - like script 1)
+        if [[ "$CURRENT_IP" == "$primary_ip" ]]; then
+            if (( primary_loss >= DEGRADED_LOSS || primary_rtt >= DEGRADED_RTT )); then
+                CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
+                log "Primary degraded streak: $CURRENT_BAD_STREAK/$BAD_STREAK_LIMIT" "WARNING"
+            else
+                CURRENT_BAD_STREAK=0
+            fi
+        fi
+        
+        # تصمیم‌گیری (decision making) - منطق مشابه اسکریپت اول
+        # Case 1: Currently on PRIMARY
+        if [[ "$CURRENT_IP" == "$primary_ip" ]]; then
+            
+            # 1a) Primary is completely DOWN (like script 1: HARD_DOWN_LOSS=90)
+            if (( primary_loss >= HARD_DOWN_LOSS )); then
+                FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                log "Primary is DOWN! Failure count: $FAILURE_COUNT/$FAILURE_THRESHOLD" "WARNING"
+                
+                if (( FAILURE_COUNT >= FAILURE_THRESHOLD )); then
+                    # Switch to backup (like script 1)
+                    log "Primary is effectively DOWN (loss=${primary_loss}%). Switching to backup..." "WARNING"
+                    if update_cname_target "$cname" "$backup_host"; then
+                        CURRENT_IP="$backup_ip"
+                        CURRENT_BAD_STREAK=0
+                        FAILURE_COUNT=0
+                        log "Switched to Backup IP ($backup_ip)" "SUCCESS"
+                        update_state "active_ip" "$backup_ip"
+                    fi
+                fi
+            
+            # 1b) Primary is degraded but not completely DOWN (like script 1)
+            elif (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
+                log "Primary degraded for $CURRENT_BAD_STREAK checks. Checking backup..." "WARNING"
+                
+                # Check if backup is healthy enough (like script 1)
+                if (( backup_loss < HARD_DOWN_LOSS )); then
+                    log "Backup is healthy. Switching from degraded primary to backup." "INFO"
+                    if update_cname_target "$cname" "$backup_host"; then
+                        CURRENT_IP="$backup_ip"
+                        CURRENT_BAD_STREAK=0
+                        log "Switched to Backup IP ($backup_ip)" "SUCCESS"
+                        update_state "active_ip" "$backup_ip"
+                    fi
+                fi
+            
+            # 1c) Primary is healthy
+            else
+                FAILURE_COUNT=0
+                CURRENT_BAD_STREAK=0
+            fi
+        
+        # Case 2: Currently on BACKUP
+        else
+            # 2a) Check if we should switch back to primary (like script 1)
+            if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
+                log "Primary has been stable for ${PRIMARY_GOOD_STREAK} checks. Switching back to primary." "INFO"
+                if update_cname_target "$cname" "$primary_host"; then
+                    CURRENT_IP="$primary_ip"
+                    PRIMARY_GOOD_STREAK=0
+                    RECOVERY_COUNT=0
+                    log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
+                    update_state "active_ip" "$primary_ip"
+                fi
+            
+            # 2b) Primary is improving but not stable yet (like script 1)
+            elif (( primary_loss < HARD_DOWN_LOSS )); then
+                RECOVERY_COUNT=$((RECOVERY_COUNT + 1))
+                log "Primary is recovering. Recovery count: $RECOVERY_COUNT/$RECOVERY_THRESHOLD" "INFO"
+            else
+                RECOVERY_COUNT=0
+            fi
+            
+            # 2c) Check if backup itself is DOWN (like script 1)
+            if (( backup_loss >= HARD_DOWN_LOSS )); then
+                log "Backup is DOWN while active! Checking primary..." "ERROR"
+                
+                # If primary is somewhat reachable, switch back (like script 1)
+                if (( primary_loss < HARD_DOWN_LOSS )); then
+                    log "Primary is reachable. Switching back from failed backup." "WARNING"
+                    if update_cname_target "$cname" "$primary_host"; then
+                        CURRENT_IP="$primary_ip"
+                        log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
+                        update_state "active_ip" "$primary_ip"
+                    fi
+                fi
+            fi
+        fi
+        
+        # Update state file
+        update_state "failure_count" "$FAILURE_COUNT"
+        update_state "recovery_count" "$RECOVERY_COUNT"
+        
+        # Sleep before next check (like script 1: SLEEP_INTERVAL=2)
         sleep "$CHECK_INTERVAL"
     done
 }
@@ -746,10 +877,10 @@ start_monitor() {
         fi
     fi
     
-    # Start monitor in background
-    monitor_service &
+    # Start enhanced monitor in background
+    monitor_service_enhanced &
     
-    log "Monitor service started in background" "SUCCESS"
+    log "Enhanced monitor service started in background" "SUCCESS"
     log "Check logs at: $LOG_FILE" "INFO"
 }
 
@@ -799,7 +930,7 @@ show_status() {
     
     echo
     echo "════════════════════════════════════════════════"
-    echo "           CURRENT STATUS"
+    echo "           CURRENT STATUS (LIKE SCRIPT 1)"
     echo "════════════════════════════════════════════════"
     echo
     echo -e "CNAME: ${GREEN}$cname${NC}"
@@ -817,42 +948,76 @@ show_status() {
     fi
     
     echo
-    echo "Monitor Counters:"
+    echo "Monitor Counters (like Script 1):"
     echo "  Failures: $failure_count/$FAILURE_THRESHOLD"
     echo "  Recovery: $recovery_count/$RECOVERY_THRESHOLD"
     echo
     
-    # Check monitor status
+    # Check detailed health
+    echo "Detailed Health Check (like Script 1):"
+    local primary_check
+    primary_check=$(check_ip_health_detailed "$primary_ip")
+    local primary_loss
+    primary_loss=$(echo "$primary_check" | awk '{print $1}')
+    local primary_rtt
+    primary_rtt=$(echo "$primary_check" | awk '{print $2}')
+    
+    local backup_check
+    backup_check=$(check_ip_health_detailed "$backup_ip")
+    local backup_loss
+    backup_loss=$(echo "$backup_check" | awk '{print $1}')
+    local backup_rtt
+    backup_rtt=$(echo "$backup_check" | awk '{print $2}')
+    
+    echo "  Primary ($primary_ip):"
+    echo -n "    Loss: "
+    if (( primary_loss >= HARD_DOWN_LOSS )); then
+        echo -e "${RED}${primary_loss}% (DOWN)${NC}"
+    elif (( primary_loss >= DEGRADED_LOSS )); then
+        echo -e "${YELLOW}${primary_loss}% (DEGRADED)${NC}"
+    else
+        echo -e "${GREEN}${primary_loss}%${NC}"
+    fi
+    
+    echo -n "    RTT: "
+    if (( primary_rtt >= DEGRADED_RTT )); then
+        echo -e "${YELLOW}${primary_rtt}ms (DEGRADED)${NC}"
+    else
+        echo -e "${GREEN}${primary_rtt}ms${NC}"
+    fi
+    
+    echo "  Backup ($backup_ip):"
+    echo -n "    Loss: "
+    if (( backup_loss >= HARD_DOWN_LOSS )); then
+        echo -e "${RED}${backup_loss}% (DOWN)${NC}"
+    elif (( backup_loss >= DEGRADED_LOSS )); then
+        echo -e "${YELLOW}${backup_loss}% (DEGRADED)${NC}"
+    else
+        echo -e "${GREEN}${backup_loss}%${NC}"
+    fi
+    
+    echo -n "    RTT: "
+    if (( backup_rtt >= DEGRADED_RTT )); then
+        echo -e "${YELLOW}${backup_rtt}ms (DEGRADED)${NC}"
+    else
+        echo -e "${GREEN}${backup_rtt}ms${NC}"
+    fi
+    
+    echo
+    echo "Monitor Status:"
     if [ -f "$MONITOR_PID_FILE" ]; then
         local pid
         pid=$(cat "$MONITOR_PID_FILE")
         if ps -p "$pid" &>/dev/null; then
-            echo -e "Monitor: ${GREEN}RUNNING${NC} (PID: $pid)"
+            echo -e "  Service: ${GREEN}RUNNING${NC} (PID: $pid)"
+            echo -e "  Interval: ${CYAN}${CHECK_INTERVAL}s${NC}"
+            echo -e "  Mode: ${CYAN}Enhanced (like Script 1)${NC}"
         else
-            echo -e "Monitor: ${RED}STOPPED${NC}"
+            echo -e "  Service: ${RED}STOPPED${NC}"
             rm -f "$MONITOR_PID_FILE"
         fi
     else
-        echo -e "Monitor: ${YELLOW}NOT RUNNING${NC}"
-    fi
-    
-    echo
-    echo "Health Check:"
-    
-    # Check primary
-    echo -n "  Primary ($primary_ip): "
-    if check_ip_health "$primary_ip"; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
-    else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
-    fi
-    
-    # Check backup
-    echo -n "  Backup ($backup_ip): "
-    if check_ip_health "$backup_ip"; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
-    else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
+        echo -e "  Service: ${YELLOW}NOT RUNNING${NC}"
     fi
     
     echo
@@ -871,13 +1036,15 @@ show_cname() {
         echo
         echo -e "  ${GREEN}$cname${NC}"
         echo
-        echo "Use this CNAME in your applications."
-        echo "DNS propagation may take 1-2 minutes."
-        echo
-        echo "Auto-failover will:"
-        echo "  1. Monitor Primary IP every ${CHECK_INTERVAL}s"
-        echo "  2. Switch to Backup after $((CHECK_INTERVAL * FAILURE_THRESHOLD))s of downtime"
-        echo "  3. Switch back to Primary after $((CHECK_INTERVAL * RECOVERY_THRESHOLD))s of stability"
+        echo "Auto-failover Settings (matching Script 1):"
+        echo "  1. Check Primary IP every ${CHECK_INTERVAL} seconds"
+        echo "  2. Use ${PING_COUNT} pings per check"
+        echo "  3. Switch to Backup if:"
+        echo "     - Loss ≥ ${HARD_DOWN_LOSS}% for ${FAILURE_THRESHOLD} checks ($((CHECK_INTERVAL * FAILURE_THRESHOLD))s)"
+        echo "     OR"
+        echo "     - Loss ≥ ${DEGRADED_LOSS}% or RTT ≥ ${DEGRADED_RTT}ms for ${BAD_STREAK_LIMIT} consecutive checks"
+        echo "  4. Switch back to Primary if:"
+        echo "     - Loss ≤ ${PRIMARY_OK_LOSS}% and RTT ≤ ${PRIMARY_OK_RTT}ms for ${PRIMARY_STABLE_ROUNDS} consecutive checks"
         echo
     else
         log "No CNAME found. Please run setup first." "ERROR"
@@ -1025,7 +1192,7 @@ manual_failover_control() {
     echo
     echo "1. Switch to Primary IP ($primary_ip)"
     echo "2. Switch to Backup IP ($backup_ip)"
-    echo "3. Test both IPs"
+    echo "3. Test both IPs (detailed - like Script 1)"
     echo "4. Back to main menu"
     echo
     
@@ -1056,20 +1223,41 @@ manual_failover_control() {
             ;;
         3)
             echo
-            echo "Testing IP connectivity:"
-            echo "------------------------"
+            echo "Testing IP connectivity (like Script 1):"
+            echo "----------------------------------------"
+            
+            # Test primary
             echo -n "Primary IP ($primary_ip): "
-            if check_ip_health "$primary_ip"; then
-                echo -e "${GREEN}✓ HEALTHY${NC}"
+            local primary_check
+            primary_check=$(check_ip_health_detailed "$primary_ip")
+            local primary_loss
+            primary_loss=$(echo "$primary_check" | awk '{print $1}')
+            local primary_rtt
+            primary_rtt=$(echo "$primary_check" | awk '{print $2}')
+            
+            if (( primary_loss >= HARD_DOWN_LOSS )); then
+                echo -e "${RED}✗ DOWN (loss=${primary_loss}%, rtt=${primary_rtt}ms)${NC}"
+            elif (( primary_loss >= DEGRADED_LOSS || primary_rtt >= DEGRADED_RTT )); then
+                echo -e "${YELLOW}⚠ DEGRADED (loss=${primary_loss}%, rtt=${primary_rtt}ms)${NC}"
             else
-                echo -e "${RED}✗ UNHEALTHY${NC}"
+                echo -e "${GREEN}✓ HEALTHY (loss=${primary_loss}%, rtt=${primary_rtt}ms)${NC}"
             fi
             
+            # Test backup
             echo -n "Backup IP ($backup_ip): "
-            if check_ip_health "$backup_ip"; then
-                echo -e "${GREEN}✓ HEALTHY${NC}"
+            local backup_check
+            backup_check=$(check_ip_health_detailed "$backup_ip")
+            local backup_loss
+            backup_loss=$(echo "$backup_check" | awk '{print $1}')
+            local backup_rtt
+            backup_rtt=$(echo "$backup_check" | awk '{print $2}')
+            
+            if (( backup_loss >= HARD_DOWN_LOSS )); then
+                echo -e "${RED}✗ DOWN (loss=${backup_loss}%, rtt=${backup_rtt}ms)${NC}"
+            elif (( backup_loss >= DEGRADED_LOSS || backup_rtt >= DEGRADED_RTT )); then
+                echo -e "${YELLOW}⚠ DEGRADED (loss=${backup_loss}%, rtt=${backup_rtt}ms)${NC}"
             else
-                echo -e "${RED}✗ UNHEALTHY${NC}"
+                echo -e "${GREEN}✓ HEALTHY (loss=${backup_loss}%, rtt=${backup_rtt}ms)${NC}"
             fi
             ;;
         4)
