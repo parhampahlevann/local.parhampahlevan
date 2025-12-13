@@ -1,248 +1,203 @@
 #!/bin/bash
 set -euo pipefail
 
-# =============================================
-# CLOUDFLARE DUAL-IP STABLE (NO PROXY)
-# =============================================
+# =====================================================
+# CLOUDFLARE LOAD BALANCER - STABLE MENU VERSION
+# =====================================================
 
-CONFIG_DIR="$HOME/.cf-auto-failover"
+CONFIG_DIR="$HOME/.cf-lb"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
-LAST_CNAME_FILE="$CONFIG_DIR/last_cname.txt"
 
 CF_API_BASE="https://api.cloudflare.com/client/v4"
+
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-BASE_HOST=""
+BASE_DOMAIN=""
+SUBDOMAIN="app"
+SERVICE_PORT=443
 
-TTL=600   # 10 minutes - key for stability
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# =============================================
-# UTILS
-# =============================================
-
+# ---------------- UTILS ----------------
 log() {
-    local msg="$1"
-    local lvl="${2:-INFO}"
-    local ts
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo -e "${CYAN}[$ts] [$lvl]${NC} $msg"
-    echo "[$ts] [$lvl] $msg" >> "$LOG_FILE"
+  local msg="$1"
+  local lvl="${2:-INFO}"
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$ts][$lvl] $msg"
+  echo "[$ts][$lvl] $msg" >> "$LOG_FILE"
 }
 
 ensure_dir() {
-    mkdir -p "$CONFIG_DIR"
-    touch "$LOG_FILE"
+  mkdir -p "$CONFIG_DIR"
+  touch "$LOG_FILE"
 }
 
 pause() {
-    read -rp "Press Enter to continue..."
+  read -rp "Press Enter to continue..."
 }
 
-# =============================================
-# CONFIG
-# =============================================
-
+# ---------------- CONFIG ----------------
 load_config() {
-    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+  [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 }
 
 save_config() {
-    cat > "$CONFIG_FILE" <<EOF
+  cat > "$CONFIG_FILE" <<EOF
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
-BASE_HOST="$BASE_HOST"
+BASE_DOMAIN="$BASE_DOMAIN"
+SUBDOMAIN="$SUBDOMAIN"
+SERVICE_PORT="$SERVICE_PORT"
 EOF
-    log "Configuration saved" "SUCCESS"
+  log "Config saved" "SUCCESS"
 }
 
-# =============================================
-# API
-# =============================================
+# ---------------- API ----------------
+api() {
+  local method="$1"
+  local endpoint="$2"
+  local data="${3:-}"
 
-api_request() {
-    local method="$1"
-    local endpoint="$2"
-    local data="${3:-}"
-
-    if [ -n "$data" ]; then
-        curl -s -X "$method" "$CF_API_BASE$endpoint" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$data"
-    else
-        curl -s -X "$method" "$CF_API_BASE$endpoint" \
-            -H "Authorization: Bearer $CF_API_TOKEN"
-    fi
+  if [ -n "$data" ]; then
+    curl -s -X "$method" "$CF_API_BASE$endpoint" \
+      -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "$data"
+  else
+    curl -s -X "$method" "$CF_API_BASE$endpoint" \
+      -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json"
+  fi
 }
 
-test_api() {
-    api_request GET "/user/tokens/verify" | jq -e '.success==true' >/dev/null
+check_api() {
+  api GET "/user/tokens/verify" | jq -e '.success==true' >/dev/null
 }
 
-test_zone() {
-    api_request GET "/zones/$CF_ZONE_ID" | jq -e '.success==true' >/dev/null
+check_zone() {
+  api GET "/zones/$CF_ZONE_ID" | jq -e '.success==true' >/dev/null
 }
 
-# =============================================
-# DNS
-# =============================================
+# ---------------- SETUP ----------------
+setup_load_balancer() {
+  clear
+  echo "=== Load Balancer Stable Setup ==="
 
-create_dns_record() {
-    local name="$1"
-    local ip="$2"
+  read -rp "Primary IP: " PRIMARY_IP
+  read -rp "Backup IP: " BACKUP_IP
 
-    api_request POST "/zones/$CF_ZONE_ID/dns_records" "$(cat <<EOF
+  HOSTNAME="${SUBDOMAIN}.${BASE_DOMAIN}"
+
+  echo "Creating health monitor..."
+  MONITOR_ID=$(api POST "/user/load_balancers/monitors" "{
+    \"type\":\"tcp\",
+    \"interval\":30,
+    \"timeout\":5,
+    \"retries\":2,
+    \"port\":$SERVICE_PORT
+  }" | jq -r '.result.id')
+
+  echo "Creating primary pool..."
+  PRIMARY_POOL=$(api POST "/zones/$CF_ZONE_ID/load_balancers/pools" "{
+    \"name\":\"primary-pool\",
+    \"monitor\":\"$MONITOR_ID\",
+    \"origins\":[{\"name\":\"primary\",\"address\":\"$PRIMARY_IP\",\"enabled\":true}]
+  }" | jq -r '.result.id')
+
+  echo "Creating backup pool..."
+  BACKUP_POOL=$(api POST "/zones/$CF_ZONE_ID/load_balancers/pools" "{
+    \"name\":\"backup-pool\",
+    \"monitor\":\"$MONITOR_ID\",
+    \"origins\":[{\"name\":\"backup\",\"address\":\"$BACKUP_IP\",\"enabled\":true}]
+  }" | jq -r '.result.id')
+
+  echo "Creating Load Balancer DNS..."
+  api POST "/zones/$CF_ZONE_ID/load_balancers" "{
+    \"name\":\"$HOSTNAME\",
+    \"default_pools\":[\"$PRIMARY_POOL\"],
+    \"fallback_pool\":\"$BACKUP_POOL\",
+    \"proxied\":false,
+    \"ttl\":300
+  }" | jq -e '.success==true' >/dev/null
+
+  cat > "$STATE_FILE" <<EOF
 {
-  "type": "A",
-  "name": "$name",
-  "content": "$ip",
-  "ttl": $TTL,
-  "proxied": false
-}
-EOF
-)" | jq -e '.success==true' >/dev/null
-}
-
-validate_ip() {
-    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-# =============================================
-# SETUP
-# =============================================
-
-setup_dual_ip() {
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "   DUAL IP SETUP (NO PROXY - STABLE DNS)"
-    echo "════════════════════════════════════════════════"
-    echo
-
-    local ip1 ip2
-
-    while true; do
-        read -rp "Primary IP: " ip1
-        validate_ip "$ip1" && break
-        log "Invalid IP" "ERROR"
-    done
-
-    while true; do
-        read -rp "Backup IP: " ip2
-        validate_ip "$ip2" && break
-        log "Invalid IP" "ERROR"
-    done
-
-    local id cname
-    id=$(date +%s%N | md5sum | cut -c1-8)
-    cname="app-$id.$BASE_HOST"
-
-    log "Creating stable DNS records (TTL=$TTL)..." "INFO"
-
-    create_dns_record "$cname" "$ip1"
-    create_dns_record "$cname" "$ip2"
-
-    cat > "$STATE_FILE" <<EOF
-{
-  "cname": "$cname",
-  "primary_ip": "$ip1",
-  "backup_ip": "$ip2",
-  "ttl": $TTL,
-  "mode": "dual-dns-stable"
+  "hostname":"$HOSTNAME",
+  "primary_ip":"$PRIMARY_IP",
+  "backup_ip":"$BACKUP_IP",
+  "mode":"load-balancer-stable"
 }
 EOF
 
-    echo "$cname" > "$LAST_CNAME_FILE"
-
-    echo
-    log "SETUP COMPLETED — STABLE MODE" "SUCCESS"
-    echo
-    echo "CNAME:"
-    echo -e "  ${GREEN}$cname${NC}"
-    echo
-    echo "IPs:"
-    echo "  - $ip1 (Primary)"
-    echo "  - $ip2 (Backup)"
-    echo
-    echo "✔ No proxy"
-    echo "✔ No DNS switching"
-    echo "✔ Long TTL prevents reconnect"
+  log "Load Balancer setup completed" "SUCCESS"
 }
 
-# =============================================
-# INFO
-# =============================================
-
+# ---------------- INFO ----------------
 show_status() {
-    [ -f "$STATE_FILE" ] && jq . "$STATE_FILE" || log "No setup found" "ERROR"
+  [ -f "$STATE_FILE" ] && jq . "$STATE_FILE" || log "No active setup" "WARN"
 }
 
-show_cname() {
-    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME" "ERROR"
+show_hostname() {
+  jq -r '.hostname' "$STATE_FILE" 2>/dev/null || echo "N/A"
 }
 
 cleanup() {
-    rm -f "$STATE_FILE" "$LAST_CNAME_FILE"
-    log "Local state removed (DNS untouched)" "WARNING"
+  rm -f "$STATE_FILE"
+  log "Local state removed (Cloudflare resources kept)" "WARN"
 }
 
-# =============================================
-# CONFIG
-# =============================================
-
+# ---------------- CONFIG MENU ----------------
 configure_api() {
-    read -rp "API Token: " CF_API_TOKEN
-    test_api || { log "Invalid API token" "ERROR"; return; }
+  read -rp "API Token: " CF_API_TOKEN
+  check_api || { log "Invalid API token" "ERROR"; return; }
 
-    read -rp "Zone ID: " CF_ZONE_ID
-    test_zone || { log "Invalid Zone ID" "ERROR"; return; }
+  read -rp "Zone ID: " CF_ZONE_ID
+  check_zone || { log "Invalid Zone ID" "ERROR"; return; }
 
-    read -rp "Base domain: " BASE_HOST
-    save_config
+  read -rp "Base domain (example.com): " BASE_DOMAIN
+  read -rp "Subdomain [app]: " tmp
+  [ -n "$tmp" ] && SUBDOMAIN="$tmp"
+
+  read -rp "Service port [443]: " tmp
+  [ -n "$tmp" ] && SERVICE_PORT="$tmp"
+
+  save_config
 }
 
-# =============================================
-# MENU
-# =============================================
-
+# ---------------- MENU ----------------
 main() {
-    ensure_dir
-    load_config
+  ensure_dir
+  load_config
 
-    while true; do
-        clear
-        echo "════════════════════════════════════"
-        echo "  CLOUDFLARE DUAL IP (NO PROXY)"
-        echo "════════════════════════════════════"
-        echo "1) Complete Setup"
-        echo "2) Show Status"
-        echo "3) Start Monitor (Disabled)"
-        echo "4) Stop Monitor (Disabled)"
-        echo "5) Manual Failover (Disabled)"
-        echo "6) Show CNAME"
-        echo "7) Cleanup"
-        echo "8) Configure API"
-        echo "9) Exit"
-        echo
+  while true; do
+    clear
+    echo "=================================="
+    echo " Cloudflare Stable Load Balancer"
+    echo "=================================="
+    echo "1) Complete Setup"
+    echo "2) Show Status"
+    echo "3) Start Monitor (Disabled)"
+    echo "4) Stop Monitor (Disabled)"
+    echo "5) Manual Failover (Disabled)"
+    echo "6) Show Hostname"
+    echo "7) Cleanup (local)"
+    echo "8) Configure API"
+    echo "9) Exit"
+    echo
 
-        read -rp "Select: " c
-        case $c in
-            1) setup_dual_ip ;;
-            2) show_status ;;
-            3|4|5) log "This feature is disabled" "WARNING" ;;
-            6) show_cname ;;
-            7) cleanup ;;
-            8) configure_api ;;
-            9) exit 0 ;;
-        esac
-        pause
-    done
+    read -rp "Select: " c
+    case "$c" in
+      1) setup_load_balancer ;;
+      2) show_status ;;
+      3|4|5) log "This option is disabled by design" "INFO" ;;
+      6) show_hostname ;;
+      7) cleanup ;;
+      8) configure_api ;;
+      9) exit 0 ;;
+    esac
+    pause
+  done
 }
 
 main
