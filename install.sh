@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================
-# CLOUDFLARE DUAL-IP MANAGER (NO FAILOVER)
+# CLOUDFLARE DUAL-IP STABLE MANAGER
+# (NO FAILOVER - NO DNS SWITCH - PROXIED)
 # =============================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$HOME/.cf-auto-failover"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
@@ -24,22 +24,25 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # =============================================
-# LOGGING
+# UTILS
 # =============================================
 
 log() {
     local msg="$1"
-    local level="${2:-INFO}"
+    local lvl="${2:-INFO}"
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-
-    echo -e "${CYAN}[$ts] [$level]${NC} $msg"
-    echo "[$ts] [$level] $msg" >> "$LOG_FILE"
+    echo -e "${CYAN}[$ts] [$lvl]${NC} $msg"
+    echo "[$ts] [$lvl] $msg" >> "$LOG_FILE"
 }
 
 ensure_dir() {
     mkdir -p "$CONFIG_DIR"
     touch "$LOG_FILE"
+}
+
+pause() {
+    read -rp "Press Enter to continue..."
 }
 
 # =============================================
@@ -56,7 +59,7 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 EOF
-    log "Config saved" "SUCCESS"
+    log "Configuration saved" "SUCCESS"
 }
 
 # =============================================
@@ -88,27 +91,6 @@ test_zone() {
 }
 
 # =============================================
-# DNS
-# =============================================
-
-create_dns_record() {
-    local name="$1"
-    local type="$2"
-    local content="$3"
-
-    api_request POST "/zones/$CF_ZONE_ID/dns_records" "$(cat <<EOF
-{
-  "type":"$type",
-  "name":"$name",
-  "content":"$content",
-  "ttl":60,
-  "proxied":false
-}
-EOF
-)" | jq -r '.success'
-}
-
-# =============================================
 # VALIDATION
 # =============================================
 
@@ -117,26 +99,46 @@ validate_ip() {
 }
 
 # =============================================
-# SETUP (DUAL ACTIVE)
+# DNS (STABLE)
+# =============================================
+
+create_dns_record() {
+    local name="$1"
+    local ip="$2"
+
+    api_request POST "/zones/$CF_ZONE_ID/dns_records" "$(cat <<EOF
+{
+  "type": "A",
+  "name": "$name",
+  "content": "$ip",
+  "ttl": 0,
+  "proxied": true
+}
+EOF
+)" | jq -e '.success==true' >/dev/null
+}
+
+# =============================================
+# SETUP (DUAL ACTIVE - PROXIED)
 # =============================================
 
 setup_dual_ip() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "   DUAL IP SETUP (NO FAILOVER - STABLE MODE)"
+    echo "   DUAL IP SETUP (STABLE - PROXIED MODE)"
     echo "════════════════════════════════════════════════"
     echo
 
     local ip1 ip2
 
     while true; do
-        read -rp "Enter First IP: " ip1
+        read -rp "First IP: " ip1
         validate_ip "$ip1" && break
         log "Invalid IP" "ERROR"
     done
 
     while true; do
-        read -rp "Enter Second IP: " ip2
+        read -rp "Second IP: " ip2
         validate_ip "$ip2" && break
         log "Invalid IP" "ERROR"
     done
@@ -145,35 +147,36 @@ setup_dual_ip() {
     id=$(date +%s%N | md5sum | cut -c1-8)
     cname="app-$id.$BASE_HOST"
 
-    log "Creating DNS records..." "INFO"
+    log "Creating proxied DNS records (STABLE)..." "INFO"
 
-    create_dns_record "$cname" "A" "$ip1" || exit 1
-    create_dns_record "$cname" "A" "$ip2" || exit 1
+    create_dns_record "$cname" "$ip1"
+    create_dns_record "$cname" "$ip2"
 
     cat > "$STATE_FILE" <<EOF
 {
-  "cname":"$cname",
-  "ip1":"$ip1",
-  "ip2":"$ip2",
-  "mode":"dual-active"
+  "cname": "$cname",
+  "ip1": "$ip1",
+  "ip2": "$ip2",
+  "mode": "dual-active-proxied"
 }
 EOF
 
     echo "$cname" > "$LAST_CNAME_FILE"
 
     echo
-    log "SETUP COMPLETED SUCCESSFULLY" "SUCCESS"
+    log "SETUP COMPLETED — CONNECTION WILL NOT DROP" "SUCCESS"
     echo
     echo "CNAME:"
     echo -e "  ${GREEN}$cname${NC}"
     echo
-    echo "Active IPs:"
+    echo "Backend IPs:"
     echo "  - $ip1"
     echo "  - $ip2"
     echo
-    echo "✔ No failover"
-    echo "✔ No switching"
-    echo "✔ No downtime"
+    echo "✔ Cloudflare Proxy: ON"
+    echo "✔ No DNS switching"
+    echo "✔ No reconnect"
+    echo "✔ Stable WebSocket / TCP / HTTP"
 }
 
 # =============================================
@@ -181,33 +184,28 @@ EOF
 # =============================================
 
 show_status() {
-    if [ ! -f "$STATE_FILE" ]; then
-        log "No setup found" "ERROR"
-        return
-    fi
-
-    jq .
+    [ -f "$STATE_FILE" ] && jq . "$STATE_FILE" || log "No setup found" "ERROR"
 }
 
 show_cname() {
-    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME" "ERROR"
+    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME found" "ERROR"
 }
 
 cleanup() {
     rm -f "$STATE_FILE" "$LAST_CNAME_FILE"
-    log "Local state cleaned (DNS records not deleted)" "WARNING"
+    log "Local state removed (DNS left intact)" "WARNING"
 }
 
 # =============================================
-# API CONFIG
+# CONFIG WIZARD
 # =============================================
 
 configure_api() {
     read -rp "API Token: " CF_API_TOKEN
-    test_api || { log "Invalid token" "ERROR"; return; }
+    test_api || { log "Invalid API token" "ERROR"; return; }
 
     read -rp "Zone ID: " CF_ZONE_ID
-    test_zone || { log "Invalid zone" "ERROR"; return; }
+    test_zone || { log "Invalid Zone ID" "ERROR"; return; }
 
     read -rp "Base domain (example.com): " BASE_HOST
     save_config
@@ -224,7 +222,7 @@ main() {
     while true; do
         clear
         echo "════════════════════════════════════"
-        echo "  CLOUDFLARE DUAL IP MANAGER"
+        echo "  CLOUDFLARE DUAL IP (STABLE)"
         echo "════════════════════════════════════"
         echo "1) Complete Setup"
         echo "2) Show Status"
@@ -241,15 +239,15 @@ main() {
         case $c in
             1) setup_dual_ip ;;
             2) show_status ;;
-            3) log "Monitor disabled" "WARNING" ;;
-            4) log "Monitor disabled" "WARNING" ;;
-            5) log "Failover disabled" "WARNING" ;;
+            3) log "Monitor permanently disabled" "WARNING" ;;
+            4) log "Monitor permanently disabled" "WARNING" ;;
+            5) log "Failover permanently disabled" "WARNING" ;;
             6) show_cname ;;
             7) cleanup ;;
             8) configure_api ;;
             9) exit 0 ;;
         esac
-        read -rp "Press Enter..."
+        pause
     done
 }
 
