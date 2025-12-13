@@ -1,38 +1,14 @@
 #!/bin/bash
 
 # =============================================
-# SMART PING-BASED FAILOVER
+# SIMPLE PING FAILOVER
 # =============================================
 
-set -euo pipefail
-
 # Configuration
-CONFIG_DIR="$HOME/.smart-failover"
+CONFIG_DIR="$HOME/.simple-failover"
 CONFIG_FILE="$CONFIG_DIR/config"
 LOG_FILE="$CONFIG_DIR/failover.log"
-PID_FILE="$CONFIG_DIR/monitor.pid"
-
-# Cloudflare API
-CF_API_BASE="https://api.cloudflare.com/client/v4"
-CF_API_TOKEN=""
-CF_ZONE_ID=""
-BASE_HOST=""
-
-# Failover Settings
-CHECK_INTERVAL=10           # Check every 10 seconds
-DOWN_TIMEOUT=60             # 1 minute downtime before switch
-STABLE_TIME=60              # 1 minute stability before return
-PING_COUNT=3                # 3 pings for reliability
-PING_TIMEOUT=2              # 2 second timeout
-
-# State variables (will be loaded from config)
-CURRENT_IP=""
-CNAME=""
-CNAME_RECORD_ID=""
-PRIMARY_HOST=""
-BACKUP_HOST=""
-PRIMARY_IP=""
-BACKUP_IP=""
+PID_FILE="$CONFIG_DIR/pid"
 
 # Colors
 RED='\033[0;31m'
@@ -41,529 +17,322 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # =============================================
-# LOGGING
-# =============================================
-
-log() {
-    local msg="$1"
-    local level="${2:-INFO}"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    case $level in
-        "ERROR") 
-            echo -e "${RED}[$timestamp] $msg${NC}"
-            echo "[$timestamp] [ERROR] $msg" >> "$LOG_FILE"
-            ;;
-        "SUCCESS") 
-            echo -e "${GREEN}[$timestamp] $msg${NC}"
-            echo "[$timestamp] [SUCCESS] $msg" >> "$LOG_FILE"
-            ;;
-        "WARNING") 
-            echo -e "${YELLOW}[$timestamp] $msg${NC}"
-            echo "[$timestamp] [WARNING] $msg" >> "$LOG_FILE"
-            ;;
-        *) 
-            echo "[$timestamp] $msg"
-            echo "[$timestamp] [INFO] $msg" >> "$LOG_FILE"
-            ;;
-    esac
-}
-
-# =============================================
-# BASIC FUNCTIONS
-# =============================================
-
-ensure_dir() {
-    mkdir -p "$CONFIG_DIR"
-    touch "$LOG_FILE" 2>/dev/null || true
-}
-
-check_prerequisites() {
-    local missing=0
-    
-    if ! command -v curl &>/dev/null; then
-        echo "Please install curl: sudo apt-get install curl"
-        missing=1
-    fi
-    
-    if ! command -v jq &>/dev/null; then
-        echo "Please install jq: sudo apt-get install jq"
-        missing=1
-    fi
-    
-    if ! command -v ping &>/dev/null; then
-        echo "Please install ping: sudo apt-get install iputils-ping"
-        missing=1
-    fi
-    
-    if [ $missing -eq 1 ]; then
-        exit 1
-    fi
-}
-
-# =============================================
-# CONFIGURATION MANAGEMENT
-# =============================================
-
-save_config() {
-    cat > "$CONFIG_FILE" << EOF
-CF_API_TOKEN="$CF_API_TOKEN"
-CF_ZONE_ID="$CF_ZONE_ID"
-BASE_HOST="$BASE_HOST"
-PRIMARY_IP="$PRIMARY_IP"
-BACKUP_IP="$BACKUP_IP"
-CNAME="$CNAME"
-PRIMARY_HOST="$PRIMARY_HOST"
-BACKUP_HOST="$BACKUP_HOST"
-CNAME_RECORD_ID="$CNAME_RECORD_ID"
-CURRENT_IP="$CURRENT_IP"
-EOF
-    log "Configuration saved" "SUCCESS"
-}
-
-load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE" 2>/dev/null || true
-        return 0
-    fi
-    return 1
-}
-
-# =============================================
-# CLOUDFLARE API
-# =============================================
-
-cf_request() {
-    local method="$1"
-    local endpoint="$2"
-    local data="${3:-}"
-    
-    local url="${CF_API_BASE}${endpoint}"
-    local response
-    
-    if [ -n "$data" ]; then
-        response=$(curl -s -X "$method" "$url" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --max-time 10 \
-            --data "$data" 2>/dev/null || echo '{"success":false}')
-    else
-        response=$(curl -s -X "$method" "$url" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --max-time 10 \
-            2>/dev/null || echo '{"success":false}')
-    fi
-    
-    echo "$response"
-}
-
-# =============================================
-# PING CHECK
-# =============================================
-
-check_ping() {
-    local ip="$1"
-    
-    # Try 3 pings with 2 second timeout
-    if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ip" &>/dev/null; then
-        echo "success"
-    else
-        echo "failed"
-    fi
-}
-
-# =============================================
-# FAILOVER FUNCTIONS
-# =============================================
-
-switch_to_backup() {
-    log "Primary down for 1 minute. Switching to backup: $BACKUP_IP" "WARNING"
-    
-    local data
-    data=$(cat << EOF
-{
-  "content": "$BACKUP_HOST"
-}
-EOF
-)
-    
-    local response
-    response=$(cf_request "PATCH" "/zones/${CF_ZONE_ID}/dns_records/$CNAME_RECORD_ID" "$data")
-    
-    if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        CURRENT_IP="$BACKUP_IP"
-        save_config
-        log "Switched to backup successfully" "SUCCESS"
-        return 0
-    else
-        log "Failed to switch to backup" "ERROR"
-        return 1
-    fi
-}
-
-switch_to_primary() {
-    log "Primary stable for 1 minute. Switching back to primary: $PRIMARY_IP" "INFO"
-    
-    local data
-    data=$(cat << EOF
-{
-  "content": "$PRIMARY_HOST"
-}
-EOF
-)
-    
-    local response
-    response=$(cf_request "PATCH" "/zones/${CF_ZONE_ID}/dns_records/$CNAME_RECORD_ID" "$data")
-    
-    if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        CURRENT_IP="$PRIMARY_IP"
-        save_config
-        log "Switched back to primary successfully" "SUCCESS"
-        return 0
-    else
-        log "Failed to switch to primary" "ERROR"
-        return 1
-    fi
-}
-
-# =============================================
-# MONITORING
-# =============================================
-
-monitor() {
-    log "Starting smart failover monitor" "INFO"
-    log "Primary IP: $PRIMARY_IP, Backup IP: $BACKUP_IP" "INFO"
-    log "Check interval: ${CHECK_INTERVAL}s, Down timeout: ${DOWN_TIMEOUT}s, Stable time: ${STABLE_TIME}s" "INFO"
-    
-    local primary_down_counter=0
-    local primary_stable_counter=0
-    local is_on_backup=false
-    
-    # Initial check
-    if [ "$CURRENT_IP" = "$BACKUP_IP" ]; then
-        is_on_backup=true
-        log "Currently on backup IP" "INFO"
-    else
-        log "Currently on primary IP" "INFO"
-    fi
-    
-    # Save PID
-    echo $$ > "$PID_FILE"
-    
-    # Main monitoring loop
-    while true; do
-        # Check primary IP
-        local ping_result
-        ping_result=$(check_ping "$PRIMARY_IP")
-        
-        if [ "$ping_result" = "success" ]; then
-            # Primary is UP
-            primary_down_counter=0
-            
-            if [ "$is_on_backup" = true ]; then
-                # We're on backup, but primary is back up
-                primary_stable_counter=$((primary_stable_counter + CHECK_INTERVAL))
-                log "Primary is up. Stable for: ${primary_stable_counter}s/${STABLE_TIME}s" "INFO"
-                
-                # If primary has been stable for 1 minute, switch back
-                if [ $primary_stable_counter -ge $STABLE_TIME ]; then
-                    if switch_to_primary; then
-                        is_on_backup=false
-                        primary_stable_counter=0
-                    fi
-                fi
-            else
-                # We're on primary, everything is fine
-                primary_stable_counter=0
-            fi
-            
-        else
-            # Primary is DOWN
-            primary_stable_counter=0
-            
-            if [ "$is_on_backup" = false ]; then
-                # We're on primary but it's down
-                primary_down_counter=$((primary_down_counter + CHECK_INTERVAL))
-                log "Primary is down. Down time: ${primary_down_counter}s/${DOWN_TIMEOUT}s" "WARNING"
-                
-                # If primary has been down for 1 minute, switch to backup
-                if [ $primary_down_counter -ge $DOWN_TIMEOUT ]; then
-                    if switch_to_backup; then
-                        is_on_backup=true
-                        primary_down_counter=0
-                    fi
-                fi
-            else
-                # Already on backup
-                log "Primary still down, staying on backup" "INFO"
-            fi
-        fi
-        
-        # Wait before next check
-        sleep "$CHECK_INTERVAL"
-    done
-}
-
-start_monitor() {
-    if ! load_config; then
-        log "No configuration found. Please run --setup first" "ERROR"
-        return 1
-    fi
-    
-    if [ -z "$CNAME_RECORD_ID" ]; then
-        log "Invalid configuration. Please run --setup again" "ERROR"
-        return 1
-    fi
-    
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null)
-        if ps -p "$pid" &>/dev/null; then
-            log "Monitor is already running (PID: $pid)" "INFO"
-            return 0
-        else
-            rm -f "$PID_FILE"
-        fi
-    fi
-    
-    # Start monitor in background
-    monitor &
-    
-    log "Monitor started in background" "SUCCESS"
-    log "Check status with: $0 --status" "INFO"
-    log "View logs with: $0 --log" "INFO"
-}
-
-stop_monitor() {
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE")
-        
-        if kill "$pid" 2>/dev/null; then
-            log "Monitor stopped (PID: $pid)" "SUCCESS"
-        else
-            log "Monitor was not running" "INFO"
-        fi
-        
-        rm -f "$PID_FILE"
-    else
-        log "Monitor is not running" "INFO"
-    fi
-}
-
-# =============================================
-# SETUP
+# BASIC SETUP
 # =============================================
 
 setup() {
+    echo "🔧 Setting up Simple Failover"
+    echo "=============================="
+    
+    mkdir -p "$CONFIG_DIR"
+    
+    # Get configuration
     echo
-    echo "════════════════════════════════════════════════"
-    echo "          SMART FAILOVER SETUP"
-    echo "════════════════════════════════════════════════"
-    echo
+    read -p "Enter Cloudflare API Token: " api_token
+    read -p "Enter Zone ID: " zone_id
+    read -p "Enter Domain (example.com): " domain
+    read -p "Enter Primary Server IP: " primary_ip
+    read -p "Enter Backup Server IP: " backup_ip
     
-    # Get API credentials
-    echo "Cloudflare API Setup:"
-    echo "---------------------"
-    read -rp "API Token: " CF_API_TOKEN
-    read -rp "Zone ID: " CF_ZONE_ID
-    read -rp "Base Domain (example.com): " BASE_HOST
+    # Validate IPs
+    if ! [[ $primary_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${RED}Invalid primary IP${NC}"
+        return 1
+    fi
     
-    echo
-    echo "Server IP Addresses:"
-    echo "--------------------"
+    if ! [[ $backup_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${RED}Invalid backup IP${NC}"
+        return 1
+    fi
     
-    # Get Primary IP
-    while true; do
-        read -rp "Primary IP (main server): " PRIMARY_IP
-        if [[ "$PRIMARY_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            break
-        fi
-        echo "Invalid IP address format"
-    done
-    
-    # Get Backup IP
-    while true; do
-        read -rp "Backup IP (failover server): " BACKUP_IP
-        if [[ "$BACKUP_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            if [ "$PRIMARY_IP" != "$BACKUP_IP" ]; then
-                break
-            fi
-            echo "Primary and backup IPs must be different"
-        else
-            echo "Invalid IP address format"
-        fi
-    done
-    
-    # Generate unique names
-    local timestamp
+    # Create unique subdomain
     timestamp=$(date +%s)
-    CNAME="failover-${timestamp}.${BASE_HOST}"
-    PRIMARY_HOST="primary-${timestamp}.${BASE_HOST}"
-    BACKUP_HOST="backup-${timestamp}.${BASE_HOST}"
+    cname="failover-${timestamp}.${domain}"
+    primary_host="primary-${timestamp}.${domain}"
+    backup_host="backup-${timestamp}.${domain}"
     
     echo
-    log "Creating DNS records..." "INFO"
+    echo "Creating DNS records..."
     
     # Create Primary A record
-    local primary_data
-    primary_data=$(cat << EOF
-{
-  "type": "A",
-  "name": "$PRIMARY_HOST",
-  "content": "$PRIMARY_IP",
-  "ttl": 300,
-  "proxied": false
-}
-EOF
-)
+    primary_data='{
+        "type": "A",
+        "name": "'"$primary_host"'",
+        "content": "'"$primary_ip"'",
+        "ttl": 300,
+        "proxied": false
+    }'
     
-    log "Creating primary A record: $PRIMARY_HOST → $PRIMARY_IP" "INFO"
-    local primary_response
-    primary_response=$(cf_request "POST" "/zones/${CF_ZONE_ID}/dns_records" "$primary_data")
-    local primary_record_id
-    primary_record_id=$(echo "$primary_response" | jq -r '.result.id // empty')
+    primary_response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+        -H "Authorization: Bearer $api_token" \
+        -H "Content-Type: application/json" \
+        --data "$primary_data")
+    
+    primary_record_id=$(echo "$primary_response" | grep -o '"id":"[^"]*' | cut -d'"' -f4 | head -1)
     
     if [ -z "$primary_record_id" ]; then
-        log "Failed to create primary A record" "ERROR"
+        echo -e "${RED}Failed to create primary record${NC}"
         return 1
     fi
     
     # Create Backup A record
-    local backup_data
-    backup_data=$(cat << EOF
-{
-  "type": "A",
-  "name": "$BACKUP_HOST",
-  "content": "$BACKUP_IP",
-  "ttl": 300,
-  "proxied": false
-}
-EOF
-)
+    backup_data='{
+        "type": "A",
+        "name": "'"$backup_host"'",
+        "content": "'"$backup_ip"'",
+        "ttl": 300,
+        "proxied": false
+    }'
     
-    log "Creating backup A record: $BACKUP_HOST → $BACKUP_IP" "INFO"
-    local backup_response
-    backup_response=$(cf_request "POST" "/zones/${CF_ZONE_ID}/dns_records" "$backup_data")
-    local backup_record_id
-    backup_record_id=$(echo "$backup_response" | jq -r '.result.id // empty')
+    backup_response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+        -H "Authorization: Bearer $api_token" \
+        -H "Content-Type: application/json" \
+        --data "$backup_data")
+    
+    backup_record_id=$(echo "$backup_response" | grep -o '"id":"[^"]*' | cut -d'"' -f4 | head -1)
     
     if [ -z "$backup_record_id" ]; then
-        log "Failed to create backup A record" "ERROR"
+        echo -e "${RED}Failed to create backup record${NC}"
         return 1
     fi
     
-    # Create CNAME pointing to primary
-    local cname_data
-    cname_data=$(cat << EOF
-{
-  "type": "CNAME",
-  "name": "$CNAME",
-  "content": "$PRIMARY_HOST",
-  "ttl": 300,
-  "proxied": false
-}
+    # Create CNAME
+    cname_data='{
+        "type": "CNAME",
+        "name": "'"$cname"'",
+        "content": "'"$primary_host"'",
+        "ttl": 300,
+        "proxied": false
+    }'
+    
+    cname_response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+        -H "Authorization: Bearer $api_token" \
+        -H "Content-Type: application/json" \
+        --data "$cname_data")
+    
+    cname_record_id=$(echo "$cname_response" | grep -o '"id":"[^"]*' | cut -d'"' -f4 | head -1)
+    
+    if [ -z "$cname_record_id" ]; then
+        echo -e "${RED}Failed to create CNAME record${NC}"
+        return 1
+    fi
+    
+    # Save config
+    cat > "$CONFIG_FILE" << EOF
+API_TOKEN="$api_token"
+ZONE_ID="$zone_id"
+DOMAIN="$domain"
+PRIMARY_IP="$primary_ip"
+BACKUP_IP="$backup_ip"
+CNAME="$cname"
+PRIMARY_HOST="$primary_host"
+BACKUP_HOST="$backup_host"
+CNAME_RECORD_ID="$cname_record_id"
+PRIMARY_RECORD_ID="$primary_record_id"
+BACKUP_RECORD_ID="$backup_record_id"
+CURRENT_IP="$primary_ip"
 EOF
-)
-    
-    log "Creating CNAME: $CNAME → $PRIMARY_HOST" "INFO"
-    local cname_response
-    cname_response=$(cf_request "POST" "/zones/${CF_ZONE_ID}/dns_records" "$cname_data")
-    CNAME_RECORD_ID=$(echo "$cname_response" | jq -r '.result.id // empty')
-    
-    if [ -z "$CNAME_RECORD_ID" ]; then
-        log "Failed to create CNAME record" "ERROR"
-        return 1
-    fi
-    
-    # Set initial state
-    CURRENT_IP="$PRIMARY_IP"
-    
-    # Save configuration
-    save_config
     
     echo
-    echo "════════════════════════════════════════════════"
-    log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
-    echo "════════════════════════════════════════════════"
+    echo -e "${GREEN}✅ Setup completed!${NC}"
     echo
-    echo -e "Your CNAME: ${GREEN}$CNAME${NC}"
+    echo "Your CNAME: $cname"
+    echo "Primary: $primary_ip"
+    echo "Backup: $backup_ip"
     echo
-    echo "DNS Configuration:"
-    echo "  Primary: $PRIMARY_HOST → $PRIMARY_IP"
-    echo "  Backup:  $BACKUP_HOST → $BACKUP_IP"
-    echo "  CNAME:   $CNAME → $PRIMARY_HOST"
-    echo
-    echo "Failover Logic:"
-    echo "  1. Check primary every ${CHECK_INTERVAL} seconds"
-    echo "  2. Switch to backup after ${DOWN_TIMEOUT} seconds of downtime"
-    echo "  3. Stay on backup until primary is stable for ${STABLE_TIME} seconds"
-    echo "  4. Switch back to primary automatically"
-    echo
-    echo "To start auto-failover:"
-    echo "  $0 --start"
+    echo "To start monitoring:"
+    echo "  $0 start"
     echo
 }
 
 # =============================================
-# STATUS
+# LOAD CONFIG
 # =============================================
 
-show_status() {
-    if ! load_config; then
-        log "No configuration found. Please run --setup first" "ERROR"
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE" 2>/dev/null
+        return 0
+    else
+        echo -e "${RED}No configuration found. Run 'setup' first.${NC}"
         return 1
     fi
+}
+
+# =============================================
+# MONITORING FUNCTIONS
+# =============================================
+
+check_ping() {
+    ip="$1"
+    if ping -c 3 -W 2 "$ip" >/dev/null 2>&1; then
+        echo "up"
+    else
+        echo "down"
+    fi
+}
+
+switch_dns() {
+    target_host="$1"
+    target_ip="$2"
     
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "          FAILOVER STATUS"
-    echo "════════════════════════════════════════════════"
-    echo
-    echo -e "CNAME: ${GREEN}$CNAME${NC}"
+    echo "Switching to $target_ip..."
+    
+    update_data='{
+        "content": "'"$target_host"'"
+    }'
+    
+    response=$(curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_RECORD_ID" \
+        -H "Authorization: Bearer $API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$update_data")
+    
+    if echo "$response" | grep -q '"success":true'; then
+        echo "$(date): Switched to $target_ip" >> "$LOG_FILE"
+        sed -i "s/CURRENT_IP=.*/CURRENT_IP=\"$target_ip\"/" "$CONFIG_FILE"
+        echo -e "${GREEN}✅ Switched to $target_ip${NC}"
+        return 0
+    else
+        echo "$(date): Failed to switch to $target_ip" >> "$LOG_FILE"
+        echo -e "${RED}❌ Failed to switch${NC}"
+        return 1
+    fi
+}
+
+monitor() {
+    load_config || exit 1
+    
+    echo "🔄 Starting failover monitor"
+    echo "Primary: $PRIMARY_IP"
+    echo "Backup: $BACKUP_IP"
+    echo "Check every 10 seconds"
+    echo "Switch after 60 seconds downtime"
+    echo "Return after 60 seconds stability"
     echo
     
-    # Check current DNS target
-    local current_target="Unknown"
-    if [ -n "$CNAME_RECORD_ID" ]; then
-        local record_info
-        record_info=$(cf_request "GET" "/zones/${CF_ZONE_ID}/dns_records/$CNAME_RECORD_ID")
-        if echo "$record_info" | jq -e '.success == true' &>/dev/null; then
-            current_target=$(echo "$record_info" | jq -r '.result.content // "Unknown"')
+    down_counter=0
+    stable_counter=0
+    on_backup=false
+    
+    # Save PID
+    echo $$ > "$PID_FILE"
+    
+    while true; do
+        # Check primary
+        status=$(check_ping "$PRIMARY_IP")
+        
+        if [ "$status" = "up" ]; then
+            # Primary is up
+            down_counter=0
+            
+            if [ "$on_backup" = true ]; then
+                stable_counter=$((stable_counter + 10))
+                echo "Primary up. Stable for ${stable_counter}s/60s"
+                
+                if [ $stable_counter -ge 60 ]; then
+                    if switch_dns "$PRIMARY_HOST" "$PRIMARY_IP"; then
+                        on_backup=false
+                        stable_counter=0
+                    fi
+                fi
+            else
+                stable_counter=0
+            fi
+            
+        else
+            # Primary is down
+            stable_counter=0
+            
+            if [ "$on_backup" = false ]; then
+                down_counter=$((down_counter + 10))
+                echo "Primary down. Down for ${down_counter}s/60s"
+                
+                if [ $down_counter -ge 60 ]; then
+                    # Check backup before switching
+                    backup_status=$(check_ping "$BACKUP_IP")
+                    if [ "$backup_status" = "up" ]; then
+                        if switch_dns "$BACKUP_HOST" "$BACKUP_IP"; then
+                            on_backup=true
+                            down_counter=0
+                        fi
+                    else
+                        echo "Backup also down, not switching"
+                    fi
+                fi
+            else
+                echo "Already on backup"
+            fi
+        fi
+        
+        sleep 10
+    done
+}
+
+start() {
+    if [ -f "$PID_FILE" ]; then
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if ps -p "$pid" >/dev/null 2>&1; then
+            echo -e "${YELLOW}⚠️  Monitor is already running (PID: $pid)${NC}"
+            return 0
         fi
     fi
     
-    echo "Current DNS Target: $current_target"
-    echo "Configured IPs:"
-    echo "  Primary: $PRIMARY_IP"
-    echo "  Backup:  $BACKUP_IP"
+    # Start in background
+    monitor &
+    
+    echo -e "${GREEN}✅ Monitor started${NC}"
+    echo "Check status with: $0 status"
+    echo "Stop with: $0 stop"
+}
+
+stop() {
+    if [ -f "$PID_FILE" ]; then
+        pid=$(cat "$PID_FILE")
+        if kill "$pid" 2>/dev/null; then
+            echo -e "${GREEN}✅ Monitor stopped${NC}"
+            rm -f "$PID_FILE"
+        else
+            echo -e "${YELLOW}⚠️  Monitor not running${NC}"
+            rm -f "$PID_FILE"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Monitor not running${NC}"
+    fi
+}
+
+status() {
+    if ! load_config; then
+        return 1
+    fi
+    
+    echo "📊 Failover Status"
+    echo "================="
+    echo
+    echo "CNAME: $CNAME"
+    echo "Primary IP: $PRIMARY_IP"
+    echo "Backup IP: $BACKUP_IP"
+    echo "Current IP: $CURRENT_IP"
     echo
     
     # Check ping status
-    echo "Current Ping Status:"
-    echo -n "  Primary ($PRIMARY_IP): "
-    if ping -c 1 -W 2 "$PRIMARY_IP" &>/dev/null; then
-        echo -e "${GREEN}UP${NC}"
+    echo "Ping Status:"
+    if ping -c 1 -W 2 "$PRIMARY_IP" >/dev/null 2>&1; then
+        echo -e "  Primary: ${GREEN}UP${NC}"
     else
-        echo -e "${RED}DOWN${NC}"
+        echo -e "  Primary: ${RED}DOWN${NC}"
     fi
     
-    echo -n "  Backup ($BACKUP_IP): "
-    if ping -c 1 -W 2 "$BACKUP_IP" &>/dev/null; then
-        echo -e "${GREEN}UP${NC}"
+    if ping -c 1 -W 2 "$BACKUP_IP" >/dev/null 2>&1; then
+        echo -e "  Backup: ${GREEN}UP${NC}"
     else
-        echo -e "${RED}DOWN${NC}"
+        echo -e "  Backup: ${RED}DOWN${NC}"
     fi
     
     echo
-    echo "Monitor Status:"
+    echo "Monitor:"
     if [ -f "$PID_FILE" ]; then
-        local pid
         pid=$(cat "$PID_FILE" 2>/dev/null)
-        if ps -p "$pid" &>/dev/null; then
+        if ps -p "$pid" >/dev/null 2>&1; then
             echo -e "  ${GREEN}ACTIVE${NC} (PID: $pid)"
         else
             echo -e "  ${RED}INACTIVE${NC}"
@@ -574,100 +343,130 @@ show_status() {
     fi
     
     echo
-    echo "════════════════════════════════════════════════"
+    if [ -f "$LOG_FILE" ]; then
+        echo "Recent logs:"
+        tail -5 "$LOG_FILE"
+    fi
 }
-
-# =============================================
-# CLEANUP
-# =============================================
 
 cleanup() {
     if ! load_config; then
-        log "No configuration found to cleanup" "ERROR"
+        echo -e "${RED}No configuration to cleanup${NC}"
         return 1
     fi
     
-    echo
-    echo "⚠️  WARNING: This will delete ALL DNS records!"
-    echo
-    read -rp "Type 'DELETE' to confirm: " confirm
+    echo "⚠️  WARNING: This will delete all DNS records!"
+    read -p "Type 'DELETE' to confirm: " confirm
     
     if [ "$confirm" != "DELETE" ]; then
-        log "Cleanup cancelled" "INFO"
+        echo "Cancelled"
         return 0
     fi
     
-    # Stop monitor first
-    stop_monitor
+    # Stop monitor
+    stop
     
-    log "Deleting DNS records..." "INFO"
+    # Delete DNS records
+    echo "Deleting DNS records..."
     
-    # Get record IDs (we already have them in config)
     if [ -n "$CNAME_RECORD_ID" ]; then
-        cf_request "DELETE" "/zones/${CF_ZONE_ID}/dns_records/$CNAME_RECORD_ID" >/dev/null 2>&1
-        log "Deleted CNAME record" "INFO"
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_RECORD_ID" \
+            -H "Authorization: Bearer $API_TOKEN" >/dev/null 2>&1
     fi
     
-    # Note: We don't have the A record IDs saved, but that's OK
+    if [ -n "$PRIMARY_RECORD_ID" ]; then
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$PRIMARY_RECORD_ID" \
+            -H "Authorization: Bearer $API_TOKEN" >/dev/null 2>&1
+    fi
     
-    # Remove configuration
+    if [ -n "$BACKUP_RECORD_ID" ]; then
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$BACKUP_RECORD_ID" \
+            -H "Authorization: Bearer $API_TOKEN" >/dev/null 2>&1
+    fi
+    
+    # Remove files
     rm -rf "$CONFIG_DIR"
     
-    log "Cleanup completed. All files and DNS records removed." "SUCCESS"
+    echo -e "${GREEN}✅ Cleanup completed${NC}"
 }
 
 # =============================================
-# MAIN
+# MAIN MENU
 # =============================================
 
+show_menu() {
+    echo
+    echo "╔══════════════════════════════════════════╗"
+    echo "║         SIMPLE FAILOVER MANAGER         ║"
+    echo "╠══════════════════════════════════════════╣"
+    echo "║                                          ║"
+    echo -e "║  ${GREEN}1.${NC} Setup                              ║"
+    echo -e "║  ${GREEN}2.${NC} Start Monitoring                  ║"
+    echo -e "║  ${GREEN}3.${NC} Stop Monitoring                   ║"
+    echo -e "║  ${GREEN}4.${NC} Status                            ║"
+    echo -e "║  ${GREEN}5.${NC} Cleanup                           ║"
+    echo -e "║  ${GREEN}6.${NC} Exit                              ║"
+    echo "║                                          ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo
+}
+
 main() {
-    ensure_dir
-    check_prerequisites
+    # Check for required commands
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "Please install curl: sudo apt-get install curl"
+        exit 1
+    fi
     
+    if ! command -v ping >/dev/null 2>&1; then
+        echo "Please install ping: sudo apt-get install iputils-ping"
+        exit 1
+    fi
+    
+    # Handle command line arguments
     case "${1:-}" in
-        "--setup")
+        "setup")
             setup
             ;;
-        "--start")
-            start_monitor
+        "start")
+            start
             ;;
-        "--stop")
-            stop_monitor
+        "stop")
+            stop
             ;;
-        "--status")
-            show_status
+        "status")
+            status
             ;;
-        "--log")
-            if [ -f "$LOG_FILE" ]; then
-                echo "Recent logs:"
-                echo "-----------"
-                tail -20 "$LOG_FILE"
-            else
-                echo "No log file found"
-            fi
-            ;;
-        "--cleanup")
+        "cleanup")
             cleanup
             ;;
         *)
-            echo "Usage: $0 [COMMAND]"
-            echo
-            echo "Commands:"
-            echo "  --setup    Create failover setup"
-            echo "  --start    Start auto-failover monitor"
-            echo "  --stop     Stop monitor"
-            echo "  --status   Show current status"
-            echo "  --log      Show recent logs"
-            echo "  --cleanup  Delete everything"
-            echo
-            echo "Example workflow:"
-            echo "  1. $0 --setup     # First time setup"
-            echo "  2. $0 --start     # Start monitoring"
-            echo "  3. $0 --status    # Check status anytime"
-            echo "  4. $0 --stop      # Stop when needed"
+            # Show interactive menu
+            while true; do
+                show_menu
+                read -p "Select option (1-6): " choice
+                
+                case $choice in
+                    1) setup ;;
+                    2) start ;;
+                    3) stop ;;
+                    4) status ;;
+                    5) cleanup ;;
+                    6) 
+                        echo "Goodbye!"
+                        exit 0
+                        ;;
+                    *)
+                        echo "Invalid option"
+                        ;;
+                esac
+                
+                echo
+                read -p "Press Enter to continue..."
+            done
             ;;
     esac
 }
 
-# Run main function
+# Run the script
 main "$@"
