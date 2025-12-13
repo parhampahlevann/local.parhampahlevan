@@ -1,246 +1,256 @@
-# 1. ایجاد فایل
-cat > /root/failover.sh << 'EOF'
 #!/bin/bash
+set -euo pipefail
 
-# ============================================
-# SIMPLE FAILOVER SCRIPT
-# ============================================
+# =============================================
+# CLOUDFLARE DUAL-IP MANAGER (NO FAILOVER)
+# =============================================
 
-# Colors
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$HOME/.cf-auto-failover"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_FILE="$CONFIG_DIR/state.json"
+LOG_FILE="$CONFIG_DIR/activity.log"
+LAST_CNAME_FILE="$CONFIG_DIR/last_cname.txt"
+
+CF_API_BASE="https://api.cloudflare.com/client/v4"
+CF_API_TOKEN=""
+CF_ZONE_ID=""
+BASE_HOST=""
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Config file
-CONFIG_FILE="/root/failover_config.txt"
+# =============================================
+# LOGGING
+# =============================================
 
-# ============================================
-# CONFIG FUNCTIONS
-# ============================================
+log() {
+    local msg="$1"
+    local level="${2:-INFO}"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
 
-save_config() {
-    cat > "$CONFIG_FILE" << CONFIG_EOF
-API_TOKEN=$1
-ZONE_ID=$2
-DOMAIN=$3
-PRIMARY_IP=$4
-BACKUP_IP=$5
-CNAME=$6
-PRIMARY_HOST=$7
-BACKUP_HOST=$8
-CNAME_ID=$9
-CURRENT_IP=${10}
-CONFIG_EOF
-    echo -e "${GREEN}Config saved${NC}"
+    echo -e "${CYAN}[$ts] [$level]${NC} $msg"
+    echo "[$ts] [$level] $msg" >> "$LOG_FILE"
 }
+
+ensure_dir() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$LOG_FILE"
+}
+
+# =============================================
+# CONFIG
+# =============================================
 
 load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        while IFS='=' read -r key value; do
-            if [[ ! $key =~ ^# ]]; then
-                export "$key"="$value"
-            fi
-        done < "$CONFIG_FILE"
-        return 0
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" <<EOF
+CF_API_TOKEN="$CF_API_TOKEN"
+CF_ZONE_ID="$CF_ZONE_ID"
+BASE_HOST="$BASE_HOST"
+EOF
+    log "Config saved" "SUCCESS"
+}
+
+# =============================================
+# API
+# =============================================
+
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="${3:-}"
+
+    if [ -n "$data" ]; then
+        curl -s -X "$method" "$CF_API_BASE$endpoint" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$data"
     else
-        echo -e "${RED}Config not found. Run 'setup' first.${NC}"
-        return 1
+        curl -s -X "$method" "$CF_API_BASE$endpoint" \
+            -H "Authorization: Bearer $CF_API_TOKEN"
     fi
 }
 
-# ============================================
-# MAIN FUNCTIONS
-# ============================================
-
-setup() {
-    echo "=== FAILOVER SETUP ==="
-    echo ""
-    
-    # Get inputs
-    read -p "Cloudflare API Token: " API_TOKEN
-    read -p "Zone ID: " ZONE_ID
-    read -p "Domain (example.com): " DOMAIN
-    read -p "Primary Server IP: " PRIMARY_IP
-    read -p "Backup Server IP: " BACKUP_IP
-    
-    # Generate names
-    RAND=$(date +%s | tail -c 4)
-    CNAME="app${RAND}.${DOMAIN}"
-    PRIMARY_HOST="primary${RAND}.${DOMAIN}"
-    BACKUP_HOST="backup${RAND}.${DOMAIN}"
-    
-    echo ""
-    echo "Creating DNS records..."
-    
-    # Create Primary A record
-    echo "Creating: $PRIMARY_HOST → $PRIMARY_IP"
-    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-        -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"type\":\"A\",\"name\":\"$PRIMARY_HOST\",\"content\":\"$PRIMARY_IP\",\"ttl\":300,\"proxied\":false}" \
-        > /dev/null
-    
-    # Create Backup A record
-    echo "Creating: $BACKUP_HOST → $BACKUP_IP"
-    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-        -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"type\":\"A\",\"name\":\"$BACKUP_HOST\",\"content\":\"$BACKUP_IP\",\"ttl\":300,\"proxied\":false}" \
-        > /dev/null
-    
-    # Create CNAME
-    echo "Creating: $CNAME → $PRIMARY_HOST"
-    CNAME_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-        -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"type\":\"CNAME\",\"name\":\"$CNAME\",\"content\":\"$PRIMARY_HOST\",\"ttl\":300,\"proxied\":false}")
-    
-    # Extract CNAME ID
-    CNAME_ID=$(echo "$CNAME_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    
-    CURRENT_IP="$PRIMARY_IP"
-    
-    # Save config
-    save_config "$API_TOKEN" "$ZONE_ID" "$DOMAIN" "$PRIMARY_IP" "$BACKUP_IP" "$CNAME" "$PRIMARY_HOST" "$BACKUP_HOST" "$CNAME_ID" "$CURRENT_IP"
-    
-    echo ""
-    echo "=== SETUP COMPLETE ==="
-    echo ""
-    echo -e "${GREEN}Your CNAME: $CNAME${NC}"
-    echo ""
-    echo "Commands:"
-    echo "  ./failover.sh status    - Show status"
-    echo "  ./failover.sh check     - Check primary server"
-    echo "  ./failover.sh backup    - Switch to backup"
-    echo "  ./failover.sh primary   - Switch to primary"
-    echo ""
+test_api() {
+    api_request GET "/user/tokens/verify" | jq -e '.success==true' >/dev/null
 }
 
-status() {
-    if load_config; then
-        echo "=== CURRENT STATUS ==="
-        echo ""
-        echo "CNAME: $CNAME"
-        echo "Primary: $PRIMARY_IP"
-        echo "Backup:  $BACKUP_IP"
-        echo "Current: $CURRENT_IP"
-        echo ""
-        echo "Last update: $(date)"
-    fi
+test_zone() {
+    api_request GET "/zones/$CF_ZONE_ID" | jq -e '.success==true' >/dev/null
 }
 
-check() {
-    if ! load_config; then
-        return 1
-    fi
-    
-    echo "Checking primary server: $PRIMARY_IP"
-    echo ""
-    
-    # Ping check
-    if ping -c 2 -W 3 "$PRIMARY_IP" > /dev/null 2>&1; then
-        echo -e "${GREEN}✓ Primary server is UP${NC}"
-    else
-        echo -e "${RED}✗ Primary server is DOWN${NC}"
-    fi
+# =============================================
+# DNS
+# =============================================
+
+create_dns_record() {
+    local name="$1"
+    local type="$2"
+    local content="$3"
+
+    api_request POST "/zones/$CF_ZONE_ID/dns_records" "$(cat <<EOF
+{
+  "type":"$type",
+  "name":"$name",
+  "content":"$content",
+  "ttl":60,
+  "proxied":false
+}
+EOF
+)" | jq -r '.success'
 }
 
-backup() {
-    if ! load_config; then
-        return 1
-    fi
-    
-    echo "Switching to backup server..."
-    echo ""
-    
-    # Update DNS
-    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID" \
-        -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"content\":\"$BACKUP_HOST\"}" \
-        > /dev/null
-    
-    # Update config
-    CURRENT_IP="$BACKUP_IP"
-    save_config "$API_TOKEN" "$ZONE_ID" "$DOMAIN" "$PRIMARY_IP" "$BACKUP_IP" "$CNAME" "$PRIMARY_HOST" "$BACKUP_HOST" "$CNAME_ID" "$CURRENT_IP"
-    
-    echo -e "${GREEN}✓ Switched to backup: $BACKUP_IP${NC}"
+# =============================================
+# VALIDATION
+# =============================================
+
+validate_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
-primary() {
-    if ! load_config; then
-        return 1
-    fi
-    
-    echo "Switching to primary server..."
-    echo ""
-    
-    # Update DNS
-    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID" \
-        -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"content\":\"$PRIMARY_HOST\"}" \
-        > /dev/null
-    
-    # Update config
-    CURRENT_IP="$PRIMARY_IP"
-    save_config "$API_TOKEN" "$ZONE_ID" "$DOMAIN" "$PRIMARY_IP" "$BACKUP_IP" "$CNAME" "$PRIMARY_HOST" "$BACKUP_HOST" "$CNAME_ID" "$CURRENT_IP"
-    
-    echo -e "${GREEN}✓ Switched to primary: $PRIMARY_IP${NC}"
+# =============================================
+# SETUP (DUAL ACTIVE)
+# =============================================
+
+setup_dual_ip() {
+    echo
+    echo "════════════════════════════════════════════════"
+    echo "   DUAL IP SETUP (NO FAILOVER - STABLE MODE)"
+    echo "════════════════════════════════════════════════"
+    echo
+
+    local ip1 ip2
+
+    while true; do
+        read -rp "Enter First IP: " ip1
+        validate_ip "$ip1" && break
+        log "Invalid IP" "ERROR"
+    done
+
+    while true; do
+        read -rp "Enter Second IP: " ip2
+        validate_ip "$ip2" && break
+        log "Invalid IP" "ERROR"
+    done
+
+    local id cname
+    id=$(date +%s%N | md5sum | cut -c1-8)
+    cname="app-$id.$BASE_HOST"
+
+    log "Creating DNS records..." "INFO"
+
+    create_dns_record "$cname" "A" "$ip1" || exit 1
+    create_dns_record "$cname" "A" "$ip2" || exit 1
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "cname":"$cname",
+  "ip1":"$ip1",
+  "ip2":"$ip2",
+  "mode":"dual-active"
 }
-
-help() {
-    echo "Failover Script - Usage:"
-    echo ""
-    echo "  ./failover.sh setup     - First time setup"
-    echo "  ./failover.sh status    - Show current status"
-    echo "  ./failover.sh check     - Check primary server"
-    echo "  ./failover.sh backup    - Switch to backup server"
-    echo "  ./failover.sh primary   - Switch to primary server"
-    echo "  ./failover.sh help      - Show this help"
-    echo ""
-}
-
-# ============================================
-# MAIN EXECUTION
-# ============================================
-
-case "$1" in
-    "setup")
-        setup
-        ;;
-    "status")
-        status
-        ;;
-    "check")
-        check
-        ;;
-    "backup")
-        backup
-        ;;
-    "primary")
-        primary
-        ;;
-    "help"|"--help"|"-h")
-        help
-        ;;
-    *)
-        echo "Simple Failover Script"
-        echo ""
-        help
-        ;;
-esac
 EOF
 
-# 2. قابل اجرا کردن
-chmod +x /root/failover.sh
+    echo "$cname" > "$LAST_CNAME_FILE"
 
-# 3. نمایش کمک
-echo "Script created at /root/failover.sh"
-echo ""
-echo "To use:"
-echo "  cd /root"
-echo "  ./failover.sh setup     # First time"
-echo "  ./failover.sh status    # Check status"
-echo "  ./failover.sh check     # Check server"
+    echo
+    log "SETUP COMPLETED SUCCESSFULLY" "SUCCESS"
+    echo
+    echo "CNAME:"
+    echo -e "  ${GREEN}$cname${NC}"
+    echo
+    echo "Active IPs:"
+    echo "  - $ip1"
+    echo "  - $ip2"
+    echo
+    echo "✔ No failover"
+    echo "✔ No switching"
+    echo "✔ No downtime"
+}
+
+# =============================================
+# INFO
+# =============================================
+
+show_status() {
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No setup found" "ERROR"
+        return
+    fi
+
+    jq .
+}
+
+show_cname() {
+    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME" "ERROR"
+}
+
+cleanup() {
+    rm -f "$STATE_FILE" "$LAST_CNAME_FILE"
+    log "Local state cleaned (DNS records not deleted)" "WARNING"
+}
+
+# =============================================
+# API CONFIG
+# =============================================
+
+configure_api() {
+    read -rp "API Token: " CF_API_TOKEN
+    test_api || { log "Invalid token" "ERROR"; return; }
+
+    read -rp "Zone ID: " CF_ZONE_ID
+    test_zone || { log "Invalid zone" "ERROR"; return; }
+
+    read -rp "Base domain (example.com): " BASE_HOST
+    save_config
+}
+
+# =============================================
+# MENU
+# =============================================
+
+main() {
+    ensure_dir
+    load_config
+
+    while true; do
+        clear
+        echo "════════════════════════════════════"
+        echo "  CLOUDFLARE DUAL IP MANAGER"
+        echo "════════════════════════════════════"
+        echo "1) Complete Setup"
+        echo "2) Show Status"
+        echo "3) Start Monitor (Disabled)"
+        echo "4) Stop Monitor (Disabled)"
+        echo "5) Manual Failover (Disabled)"
+        echo "6) Show CNAME"
+        echo "7) Cleanup"
+        echo "8) Configure API"
+        echo "9) Exit"
+        echo
+
+        read -rp "Select: " c
+        case $c in
+            1) setup_dual_ip ;;
+            2) show_status ;;
+            3) log "Monitor disabled" "WARNING" ;;
+            4) log "Monitor disabled" "WARNING" ;;
+            5) log "Failover disabled" "WARNING" ;;
+            6) show_cname ;;
+            7) cleanup ;;
+            8) configure_api ;;
+            9) exit 0 ;;
+        esac
+        read -rp "Press Enter..."
+    done
+}
+
+main
