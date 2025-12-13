@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE AUTO-FAILOVER MANAGER v3.0
+# CLOUDFLARE AUTO-FAILOVER MANAGER v3.1
 # =============================================
 
 set -euo pipefail
@@ -42,9 +42,9 @@ PRIMARY_OK_LOSS=50        # loss <= 50% (like script 1)
 PRIMARY_OK_RTT=450        # RTT <= 450ms (like script 1)
 PRIMARY_STABLE_ROUNDS=3   # 3 consecutive good checks (6 seconds total) (like script 1)
 
-# Failure thresholds (calculated based on CHECK_INTERVAL)
-FAILURE_THRESHOLD=2       # 2 failures before failover (4 seconds total)
-RECOVERY_THRESHOLD=3      # 3 good checks before recovery (6 seconds total)
+# Hysteresis to prevent rapid switching
+SWITCH_COOLDOWN=30        # 30 seconds cooldown after any switch
+LAST_SWITCH_TIME=0        # Track last switch time
 
 # Colors
 RED='\033[0;31m'
@@ -155,8 +155,6 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 CHECK_INTERVAL="$CHECK_INTERVAL"
-FAILURE_THRESHOLD="$FAILURE_THRESHOLD"
-RECOVERY_THRESHOLD="$RECOVERY_THRESHOLD"
 EOF
     log "Configuration saved" "SUCCESS"
 }
@@ -179,9 +177,12 @@ save_state() {
   "backup_host": "backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/app-//').$BASE_HOST",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
   "active_ip": "$primary_ip",
+  "active_host": "primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/app-//').$BASE_HOST",
+  "cname_record_id": "",
   "monitoring": true,
   "failure_count": 0,
-  "recovery_count": 0
+  "recovery_count": 0,
+  "last_switch_time": 0
 }
 EOF
 }
@@ -207,7 +208,7 @@ update_state() {
 }
 
 # =============================================
-# API FUNCTIONS
+# API FUNCTIONS - FIXED TO PREVENT DOWNTIME
 # =============================================
 
 api_request() {
@@ -217,19 +218,35 @@ api_request() {
     
     local url="${CF_API_BASE}${endpoint}"
     local response
+    local max_retries=3
+    local retry_count=0
     
-    if [ -n "$data" ]; then
-        response=$(curl -s -X "$method" "$url" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
-    else
-        response=$(curl -s -X "$method" "$url" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
-    fi
-    
-    echo "$response"
+    while [ $retry_count -lt $max_retries ]; do
+        if [ -n "$data" ]; then
+            response=$(curl -s -X "$method" "$url" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
+        else
+            response=$(curl -s -X "$method" "$url" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
+        fi
+        
+        # Check if request was successful
+        if echo "$response" | jq -e '.success == true' &>/dev/null 2>/dev/null; then
+            echo "$response"
+            return 0
+        elif [ $retry_count -eq $((max_retries - 1)) ]; then
+            # Last retry failed
+            log "API request failed after $max_retries retries" "ERROR"
+            echo "$response"
+            return 1
+        else
+            retry_count=$((retry_count + 1))
+            sleep 1
+        fi
+    done
 }
 
 test_api() {
@@ -416,31 +433,8 @@ compute_score() {
     echo $(( loss * 100 + rtt ))
 }
 
-check_ip_basic() {
-    local ip="$1"
-    
-    # Simple check for basic connectivity
-    if ping -c 1 -W 1 "$ip" &>/dev/null; then
-        return 0
-    fi
-    
-    # Fallback: try curl on port 80
-    if curl -s --max-time 2 "http://$ip" &>/dev/null; then
-        return 0
-    fi
-    
-    # Try netcat on port 80
-    if command -v nc &>/dev/null; then
-        if nc -z -w 1 "$ip" 80 &>/dev/null; then
-            return 0
-        fi
-    fi
-    
-    return 1
-}
-
 # =============================================
-# DNS MANAGEMENT
+# DNS MANAGEMENT - FIXED (NO DOWNTIME)
 # =============================================
 
 create_dns_record() {
@@ -499,37 +493,84 @@ get_cname_record_id() {
     response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        echo "$response" | jq -r '.result[0].id // empty'
+        local record_id
+        record_id=$(echo "$response" | jq -r '.result[0].id // empty')
+        # Also update the state file if we found the record
+        if [ -n "$record_id" ] && [ -f "$STATE_FILE" ]; then
+            update_state "cname_record_id" "$record_id"
+        fi
+        echo "$record_id"
     else
         echo ""
     fi
 }
 
-update_cname_target() {
+get_cname_details() {
+    local cname="$1"
+    
+    local response
+    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
+    
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        echo "$response" | jq -r '.result[0] // empty'
+    else
+        echo "{}"
+    fi
+}
+
+# FIXED: Update CNAME without deleting (no downtime)
+update_cname_target_safe() {
     local cname="$1"
     local target_host="$2"
     
-    # Get existing CNAME record ID
+    # First, try to get existing record ID
     local record_id
-    record_id=$(get_cname_record_id "$cname")
+    local current_details
+    
+    current_details=$(get_cname_details "$cname")
+    record_id=$(echo "$current_details" | jq -r '.id // empty')
     
     if [ -z "$record_id" ]; then
         log "CNAME record not found: $cname" "ERROR"
         return 1
     fi
     
-    # Delete old record
-    delete_dns_record "$record_id"
+    # Check if already pointing to the target
+    local current_target
+    current_target=$(echo "$current_details" | jq -r '.content // empty')
+    if [ "$current_target" = "$target_host" ]; then
+        log "CNAME already points to $target_host, no change needed" "INFO"
+        update_state "cname_record_id" "$record_id"
+        return 0
+    fi
     
-    # Create new record with new target
-    local new_record_id
-    new_record_id=$(create_dns_record "$cname" "CNAME" "$target_host")
+    # Update the existing record (no delete/create)
+    local data
+    data=$(cat << EOF
+{
+  "type": "CNAME",
+  "name": "$cname",
+  "content": "$target_host",
+  "ttl": 60,
+  "proxied": false
+}
+EOF
+)
     
-    if [ -n "$new_record_id" ]; then
-        log "Updated CNAME: $cname → $target_host" "SUCCESS"
+    log "Updating CNAME record: $cname → $target_host (record ID: $record_id)" "INFO"
+    
+    local response
+    response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
+    
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        log "CNAME updated successfully: $cname → $target_host" "SUCCESS"
+        update_state "cname_record_id" "$record_id"
         return 0
     else
-        log "Failed to update CNAME" "ERROR"
+        log "Failed to update CNAME record" "ERROR"
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$response")
+        log "Error details: $error_msg" "ERROR"
         return 1
     fi
 }
@@ -620,7 +661,25 @@ setup_dual_ip() {
     fi
     
     # Save state
-    save_state "$primary_ip" "$backup_ip" "$cname" "$primary_record_id" "$backup_record_id"
+    cat > "$STATE_FILE" << EOF
+{
+  "primary_ip": "$primary_ip",
+  "backup_ip": "$backup_ip",
+  "cname": "$cname",
+  "primary_record": "$primary_record_id",
+  "backup_record": "$backup_record_id",
+  "primary_host": "$primary_host",
+  "backup_host": "$backup_host",
+  "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "active_ip": "$primary_ip",
+  "active_host": "$primary_host",
+  "cname_record_id": "$cname_record_id",
+  "monitoring": true,
+  "failure_count": 0,
+  "recovery_count": 0,
+  "last_switch_time": 0
+}
+EOF
     
     # Save CNAME to file
     echo "$cname" > "$LAST_CNAME_FILE"
@@ -643,8 +702,7 @@ setup_dual_ip() {
     echo "  Ping count: ${PING_COUNT} per check"
     echo "  Degraded threshold: ${DEGRADED_LOSS}% loss or ${DEGRADED_RTT}ms RTT"
     echo "  Hard down threshold: ${HARD_DOWN_LOSS}% loss"
-    echo "  Failover after: $((CHECK_INTERVAL * FAILURE_THRESHOLD)) seconds"
-    echo "  Recovery after: $((CHECK_INTERVAL * RECOVERY_THRESHOLD)) seconds"
+    echo "  Switch cooldown: ${SWITCH_COOLDOWN} seconds (prevents rapid switching)"
     echo
     echo "Current traffic is routed to: ${GREEN}PRIMARY IP ($primary_ip)${NC}"
     echo
@@ -654,7 +712,7 @@ setup_dual_ip() {
 }
 
 # =============================================
-# ENHANCED MONITORING FUNCTIONS (LIKE SCRIPT 1)
+# ENHANCED MONITORING FUNCTIONS (FIXED)
 # =============================================
 
 perform_failover() {
@@ -663,10 +721,27 @@ perform_failover() {
     local primary_ip="$3"
     local backup_ip="$4"
     
+    local current_time
+    current_time=$(date +%s)
+    local last_switch
+    last_switch=$(jq -r '.last_switch_time // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    
+    # Check cooldown
+    if [ $((current_time - last_switch)) -lt $SWITCH_COOLDOWN ]; then
+        local remaining=$((SWITCH_COOLDOWN - (current_time - last_switch)))
+        log "Switch cooldown active. $remaining seconds remaining before next switch." "WARNING"
+        return 2
+    fi
+    
     log "Primary IP ($primary_ip) is down! Initiating failover..." "WARNING"
     log "Switching CNAME to backup: $cname → $backup_host" "INFO"
     
-    if update_cname_target "$cname" "$backup_host"; then
+    if update_cname_target_safe "$cname" "$backup_host"; then
+        update_state "active_ip" "$backup_ip"
+        update_state "active_host" "$backup_host"
+        update_state "failure_count" "0"
+        update_state "recovery_count" "0"
+        update_state "last_switch_time" "$current_time"
         log "Failover completed! Now using Backup IP ($backup_ip)" "SUCCESS"
         return 0
     else
@@ -681,10 +756,27 @@ perform_recovery() {
     local primary_ip="$3"
     local backup_ip="$4"
     
+    local current_time
+    current_time=$(date +%s)
+    local last_switch
+    last_switch=$(jq -r '.last_switch_time // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    
+    # Check cooldown
+    if [ $((current_time - last_switch)) -lt $SWITCH_COOLDOWN ]; then
+        local remaining=$((SWITCH_COOLDOWN - (current_time - last_switch)))
+        log "Switch cooldown active. $remaining seconds remaining before next switch." "WARNING"
+        return 2
+    fi
+    
     log "Primary IP ($primary_ip) is healthy again! Switching back..." "INFO"
     log "Switching CNAME to primary: $cname → $primary_host" "INFO"
     
-    if update_cname_target "$cname" "$primary_host"; then
+    if update_cname_target_safe "$cname" "$primary_host"; then
+        update_state "active_ip" "$primary_ip"
+        update_state "active_host" "$primary_host"
+        update_state "failure_count" "0"
+        update_state "recovery_count" "0"
+        update_state "last_switch_time" "$current_time"
         log "Recovery completed! Now using Primary IP ($primary_ip)" "SUCCESS"
         return 0
     else
@@ -694,8 +786,8 @@ perform_recovery() {
 }
 
 monitor_service_enhanced() {
-    log "Starting enhanced auto-monitor service (like Script 1)..." "INFO"
-    log "Monitoring interval: ${CHECK_INTERVAL} seconds" "INFO"
+    log "Starting enhanced auto-monitor service (no downtime)..." "INFO"
+    log "Monitoring interval: ${CHECK_INTERVAL} seconds, Switch cooldown: ${SWITCH_COOLDOWN}s" "INFO"
     
     # Load initial state
     local state
@@ -711,6 +803,8 @@ monitor_service_enhanced() {
     primary_host=$(echo "$state" | jq -r '.primary_host // empty')
     local backup_host
     backup_host=$(echo "$state" | jq -r '.backup_host // empty')
+    local active_ip
+    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
     
     if [ -z "$cname" ]; then
         log "No setup found. Please run setup first." "ERROR"
@@ -721,21 +815,22 @@ monitor_service_enhanced() {
     echo $$ > "$MONITOR_PID_FILE"
     
     log "Enhanced monitor service started (PID: $$)" "SUCCESS"
+    log "Active IP: $active_ip, CNAME: $cname" "INFO"
     log "Press Ctrl+C to stop monitoring" "INFO"
     
     # Trap signals
     trap 'log "Monitor service stopped" "INFO"; rm -f "$MONITOR_PID_FILE"; exit 0' INT TERM
     
-    # State variables (like script 1)
-    local CURRENT_IP="$primary_ip"
+    # State variables
+    local CURRENT_IP="$active_ip"
     local CURRENT_BAD_STREAK=0
     local PRIMARY_GOOD_STREAK=0
-    local FAILURE_COUNT=0
-    local RECOVERY_COUNT=0
+    local FAILURE_COUNT=$(echo "$state" | jq -r '.failure_count // 0')
+    local RECOVERY_COUNT=$(echo "$state" | jq -r '.recovery_count // 0')
     
     # Main monitoring loop
     while true; do
-        # Check primary IP health with detailed metrics (like script 1)
+        # Check primary IP health with detailed metrics
         local primary_check
         primary_check=$(check_ip_health_detailed "$primary_ip")
         local primary_loss
@@ -745,7 +840,7 @@ monitor_service_enhanced() {
         local primary_score
         primary_score=$(compute_score "$primary_loss" "$primary_rtt")
         
-        # Check backup IP health with detailed metrics (like script 1)
+        # Check backup IP health with detailed metrics
         local backup_check
         backup_check=$(check_ip_health_detailed "$backup_ip")
         local backup_loss
@@ -755,111 +850,140 @@ monitor_service_enhanced() {
         local backup_score
         backup_score=$(compute_score "$backup_loss" "$backup_rtt")
         
-        # Log health status
-        log "Primary: loss=${primary_loss}% rtt=${primary_rtt}ms score=$primary_score | Backup: loss=${backup_loss}% rtt=${backup_rtt}ms score=$backup_score" "INFO"
+        # Log health status (less verbose in normal operation)
+        if (( primary_loss >= DEGRADED_LOSS || primary_rtt >= DEGRADED_RTT )) || 
+           (( backup_loss >= DEGRADED_LOSS || backup_rtt >= DEGRADED_RTT )); then
+            log "Health: Primary: loss=${primary_loss}% rtt=${primary_rtt}ms | Backup: loss=${backup_loss}% rtt=${backup_rtt}ms" "INFO"
+        fi
         
-        # Track primary stability (برای برگشت روی سرور اصلی - like script 1)
+        # Track primary stability
         if (( primary_loss <= PRIMARY_OK_LOSS && primary_rtt <= PRIMARY_OK_RTT )); then
             PRIMARY_GOOD_STREAK=$((PRIMARY_GOOD_STREAK + 1))
-            log "Primary good streak: $PRIMARY_GOOD_STREAK/$PRIMARY_STABLE_ROUNDS" "INFO"
         else
             PRIMARY_GOOD_STREAK=0
         fi
         
-        # Track current degradation (برای رفتن روی بکاپ - like script 1)
+        # Track current degradation
         if [[ "$CURRENT_IP" == "$primary_ip" ]]; then
             if (( primary_loss >= DEGRADED_LOSS || primary_rtt >= DEGRADED_RTT )); then
                 CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
-                log "Primary degraded streak: $CURRENT_BAD_STREAK/$BAD_STREAK_LIMIT" "WARNING"
+                log "Primary degraded: loss=${primary_loss}% rtt=${primary_rtt}ms streak=$CURRENT_BAD_STREAK/$BAD_STREAK_LIMIT" "WARNING"
             else
                 CURRENT_BAD_STREAK=0
             fi
         fi
         
-        # تصمیم‌گیری (decision making) - منطق مشابه اسکریپت اول
-        # Case 1: Currently on PRIMARY
-        if [[ "$CURRENT_IP" == "$primary_ip" ]]; then
-            
-            # 1a) Primary is completely DOWN (like script 1: HARD_DOWN_LOSS=90)
-            if (( primary_loss >= HARD_DOWN_LOSS )); then
-                FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                log "Primary is DOWN! Failure count: $FAILURE_COUNT/$FAILURE_THRESHOLD" "WARNING"
+        # Decision making with cooldown check
+        local current_time
+        current_time=$(date +%s)
+        local last_switch
+        last_switch=$(jq -r '.last_switch_time // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+        local time_since_last_switch=$((current_time - last_switch))
+        
+        # Only proceed if cooldown period has passed
+        if [ $time_since_last_switch -ge $SWITCH_COOLDOWN ]; then
+            # Case 1: Currently on PRIMARY
+            if [[ "$CURRENT_IP" == "$primary_ip" ]]; then
                 
-                if (( FAILURE_COUNT >= FAILURE_THRESHOLD )); then
-                    # Switch to backup (like script 1)
-                    log "Primary is effectively DOWN (loss=${primary_loss}%). Switching to backup..." "WARNING"
-                    if update_cname_target "$cname" "$backup_host"; then
-                        CURRENT_IP="$backup_ip"
-                        CURRENT_BAD_STREAK=0
+                # 1a) Primary is completely DOWN
+                if (( primary_loss >= HARD_DOWN_LOSS )); then
+                    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                    
+                    if (( FAILURE_COUNT >= 2 )); then
+                        # Switch to backup
+                        log "Primary DOWN (loss=${primary_loss}%). Switching to backup..." "WARNING"
+                        if update_cname_target_safe "$cname" "$backup_host"; then
+                            CURRENT_IP="$backup_ip"
+                            CURRENT_BAD_STREAK=0
+                            FAILURE_COUNT=0
+                            update_state "active_ip" "$backup_ip"
+                            update_state "active_host" "$backup_host"
+                            update_state "failure_count" "0"
+                            update_state "last_switch_time" "$current_time"
+                            log "Switched to Backup IP ($backup_ip)" "SUCCESS"
+                        fi
+                    else
+                        log "Primary DOWN (loss=${primary_loss}%). Failure count: $FAILURE_COUNT/2" "WARNING"
+                        update_state "failure_count" "$FAILURE_COUNT"
+                    fi
+                
+                # 1b) Primary is degraded but not completely DOWN
+                elif (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
+                    log "Primary degraded for $CURRENT_BAD_STREAK checks. Checking backup..." "WARNING"
+                    
+                    # Check if backup is healthy enough
+                    if (( backup_loss < HARD_DOWN_LOSS )); then
+                        log "Switching from degraded primary to backup." "INFO"
+                        if update_cname_target_safe "$cname" "$backup_host"; then
+                            CURRENT_IP="$backup_ip"
+                            CURRENT_BAD_STREAK=0
+                            update_state "active_ip" "$backup_ip"
+                            update_state "active_host" "$backup_host"
+                            update_state "failure_count" "0"
+                            update_state "last_switch_time" "$current_time"
+                            log "Switched to Backup IP ($backup_ip)" "SUCCESS"
+                        fi
+                    fi
+                
+                # 1c) Primary is healthy
+                else
+                    if [ $FAILURE_COUNT -gt 0 ]; then
                         FAILURE_COUNT=0
-                        log "Switched to Backup IP ($backup_ip)" "SUCCESS"
-                        update_state "active_ip" "$backup_ip"
+                        update_state "failure_count" "0"
                     fi
+                    CURRENT_BAD_STREAK=0
                 fi
             
-            # 1b) Primary is degraded but not completely DOWN (like script 1)
-            elif (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
-                log "Primary degraded for $CURRENT_BAD_STREAK checks. Checking backup..." "WARNING"
-                
-                # Check if backup is healthy enough (like script 1)
-                if (( backup_loss < HARD_DOWN_LOSS )); then
-                    log "Backup is healthy. Switching from degraded primary to backup." "INFO"
-                    if update_cname_target "$cname" "$backup_host"; then
-                        CURRENT_IP="$backup_ip"
-                        CURRENT_BAD_STREAK=0
-                        log "Switched to Backup IP ($backup_ip)" "SUCCESS"
-                        update_state "active_ip" "$backup_ip"
-                    fi
-                fi
-            
-            # 1c) Primary is healthy
+            # Case 2: Currently on BACKUP
             else
-                FAILURE_COUNT=0
-                CURRENT_BAD_STREAK=0
-            fi
-        
-        # Case 2: Currently on BACKUP
-        else
-            # 2a) Check if we should switch back to primary (like script 1)
-            if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
-                log "Primary has been stable for ${PRIMARY_GOOD_STREAK} checks. Switching back to primary." "INFO"
-                if update_cname_target "$cname" "$primary_host"; then
-                    CURRENT_IP="$primary_ip"
-                    PRIMARY_GOOD_STREAK=0
-                    RECOVERY_COUNT=0
-                    log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
-                    update_state "active_ip" "$primary_ip"
-                fi
-            
-            # 2b) Primary is improving but not stable yet (like script 1)
-            elif (( primary_loss < HARD_DOWN_LOSS )); then
-                RECOVERY_COUNT=$((RECOVERY_COUNT + 1))
-                log "Primary is recovering. Recovery count: $RECOVERY_COUNT/$RECOVERY_THRESHOLD" "INFO"
-            else
-                RECOVERY_COUNT=0
-            fi
-            
-            # 2c) Check if backup itself is DOWN (like script 1)
-            if (( backup_loss >= HARD_DOWN_LOSS )); then
-                log "Backup is DOWN while active! Checking primary..." "ERROR"
-                
-                # If primary is somewhat reachable, switch back (like script 1)
-                if (( primary_loss < HARD_DOWN_LOSS )); then
-                    log "Primary is reachable. Switching back from failed backup." "WARNING"
-                    if update_cname_target "$cname" "$primary_host"; then
+                # 2a) Check if we should switch back to primary
+                if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
+                    log "Primary stable for ${PRIMARY_GOOD_STREAK} checks. Switching back..." "INFO"
+                    if update_cname_target_safe "$cname" "$primary_host"; then
                         CURRENT_IP="$primary_ip"
-                        log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
+                        PRIMARY_GOOD_STREAK=0
+                        RECOVERY_COUNT=0
                         update_state "active_ip" "$primary_ip"
+                        update_state "active_host" "$primary_host"
+                        update_state "recovery_count" "0"
+                        update_state "last_switch_time" "$current_time"
+                        log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
+                    fi
+                
+                # 2b) Primary is improving but not stable yet
+                elif (( primary_loss < HARD_DOWN_LOSS )); then
+                    RECOVERY_COUNT=$((RECOVERY_COUNT + 1))
+                    update_state "recovery_count" "$RECOVERY_COUNT"
+                else
+                    if [ $RECOVERY_COUNT -gt 0 ]; then
+                        RECOVERY_COUNT=0
+                        update_state "recovery_count" "0"
+                    fi
+                fi
+                
+                # 2c) Check if backup itself is DOWN
+                if (( backup_loss >= HARD_DOWN_LOSS )); then
+                    log "Backup DOWN while active! Checking primary..." "ERROR"
+                    
+                    # If primary is somewhat reachable, switch back
+                    if (( primary_loss < HARD_DOWN_LOSS )); then
+                        log "Switching back from failed backup." "WARNING"
+                        if update_cname_target_safe "$cname" "$primary_host"; then
+                            CURRENT_IP="$primary_ip"
+                            update_state "active_ip" "$primary_ip"
+                            update_state "active_host" "$primary_host"
+                            update_state "last_switch_time" "$current_time"
+                            log "Switched back to Primary IP ($primary_ip)" "SUCCESS"
+                        fi
                     fi
                 fi
             fi
+        else
+            # Cooldown active
+            log "Switch cooldown active: $((SWITCH_COOLDOWN - time_since_last_switch))s remaining" "INFO"
         fi
         
-        # Update state file
-        update_state "failure_count" "$FAILURE_COUNT"
-        update_state "recovery_count" "$RECOVERY_COUNT"
-        
-        # Sleep before next check (like script 1: SLEEP_INTERVAL=2)
+        # Sleep before next check
         sleep "$CHECK_INTERVAL"
     done
 }
@@ -923,38 +1047,75 @@ show_status() {
     backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
     local active_ip
     active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+    local active_host
+    active_host=$(echo "$state" | jq -r '.active_host // empty')
     local failure_count
     failure_count=$(echo "$state" | jq -r '.failure_count // 0')
     local recovery_count
     recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
+    local last_switch_time
+    last_switch_time=$(echo "$state" | jq -r '.last_switch_time // 0')
+    local cname_record_id
+    cname_record_id=$(echo "$state" | jq -r '.cname_record_id // empty')
     
     echo
     echo "════════════════════════════════════════════════"
-    echo "           CURRENT STATUS (LIKE SCRIPT 1)"
+    echo "           CURRENT STATUS (NO DOWNTIME)"
     echo "════════════════════════════════════════════════"
     echo
     echo -e "CNAME: ${GREEN}$cname${NC}"
+    echo -e "CNAME Record ID: ${CYAN}${cname_record_id:0:8}...${NC}"
     echo
+    
+    # Check current CNAME target from Cloudflare
+    local current_target=""
+    if [ -n "$cname_record_id" ]; then
+        local cname_info
+        cname_info=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records/$cname_record_id")
+        if echo "$cname_info" | jq -e '.success == true' &>/dev/null; then
+            current_target=$(echo "$cname_info" | jq -r '.result.content // empty')
+        fi
+    fi
+    
     echo "IP Addresses:"
     
     if [ "$active_ip" = "$primary_ip" ]; then
         echo -e "  Primary: $primary_ip ${GREEN}[ACTIVE]${NC}"
         echo -e "  Backup:  $backup_ip"
+        if [ -n "$current_target" ]; then
+            echo -e "  CNAME target: ${CYAN}$current_target${NC}"
+        fi
         echo -e "  Status: ${GREEN}Normal operation${NC}"
     else
-        echo -e "  Primary: $primary_ip ${RED}[DOWN]${NC}"
+        echo -e "  Primary: $primary_ip"
         echo -e "  Backup:  $backup_ip ${GREEN}[ACTIVE - FAILOVER]${NC}"
+        if [ -n "$current_target" ]; then
+            echo -e "  CNAME target: ${CYAN}$current_target${NC}"
+        fi
         echo -e "  Status: ${YELLOW}Failover active${NC}"
     fi
     
     echo
-    echo "Monitor Counters (like Script 1):"
-    echo "  Failures: $failure_count/$FAILURE_THRESHOLD"
-    echo "  Recovery: $recovery_count/$RECOVERY_THRESHOLD"
+    echo "Monitor Counters:"
+    echo "  Failures: $failure_count/2"
+    echo "  Recovery: $recovery_count/$PRIMARY_STABLE_ROUNDS"
+    
+    if [ $last_switch_time -gt 0 ]; then
+        local current_time
+        current_time=$(date +%s)
+        local time_since_switch=$((current_time - last_switch_time))
+        if [ $time_since_switch -lt $SWITCH_COOLDOWN ]; then
+            local remaining=$((SWITCH_COOLDOWN - time_since_switch))
+            echo -e "  Switch cooldown: ${YELLOW}${remaining}s remaining${NC}"
+        else
+            echo -e "  Switch cooldown: ${GREEN}Ready${NC}"
+        fi
+    fi
+    
     echo
     
     # Check detailed health
-    echo "Detailed Health Check (like Script 1):"
+    echo "Detailed Health Check:"
     local primary_check
     primary_check=$(check_ip_health_detailed "$primary_ip")
     local primary_loss
@@ -1011,7 +1172,7 @@ show_status() {
         if ps -p "$pid" &>/dev/null; then
             echo -e "  Service: ${GREEN}RUNNING${NC} (PID: $pid)"
             echo -e "  Interval: ${CYAN}${CHECK_INTERVAL}s${NC}"
-            echo -e "  Mode: ${CYAN}Enhanced (like Script 1)${NC}"
+            echo -e "  Mode: ${CYAN}No-downtime updates${NC}"
         else
             echo -e "  Service: ${RED}STOPPED${NC}"
             rm -f "$MONITOR_PID_FILE"
@@ -1036,15 +1197,13 @@ show_cname() {
         echo
         echo -e "  ${GREEN}$cname${NC}"
         echo
-        echo "Auto-failover Settings (matching Script 1):"
-        echo "  1. Check Primary IP every ${CHECK_INTERVAL} seconds"
-        echo "  2. Use ${PING_COUNT} pings per check"
-        echo "  3. Switch to Backup if:"
-        echo "     - Loss ≥ ${HARD_DOWN_LOSS}% for ${FAILURE_THRESHOLD} checks ($((CHECK_INTERVAL * FAILURE_THRESHOLD))s)"
-        echo "     OR"
-        echo "     - Loss ≥ ${DEGRADED_LOSS}% or RTT ≥ ${DEGRADED_RTT}ms for ${BAD_STREAK_LIMIT} consecutive checks"
-        echo "  4. Switch back to Primary if:"
-        echo "     - Loss ≤ ${PRIMARY_OK_LOSS}% and RTT ≤ ${PRIMARY_OK_RTT}ms for ${PRIMARY_STABLE_ROUNDS} consecutive checks"
+        echo "Auto-failover Settings:"
+        echo "  • Check every ${CHECK_INTERVAL} seconds"
+        echo "  • Switch cooldown: ${SWITCH_COOLDOWN} seconds (prevents rapid switching)"
+        echo "  • No-downtime updates: Uses Cloudflare API update instead of delete/create"
+        echo
+        echo "DNS propagation is instant with Cloudflare."
+        echo "No downtime during failover/recovery."
         echo
     else
         log "No CNAME found. Please run setup first." "ERROR"
@@ -1087,10 +1246,15 @@ cleanup() {
     primary_record=$(echo "$state" | jq -r '.primary_record // empty')
     local backup_record
     backup_record=$(echo "$state" | jq -r '.backup_record // empty')
+    local cname_record_id
+    cname_record_id=$(echo "$state" | jq -r '.cname_record_id // empty')
     
     # Delete CNAME record
-    local cname_record_id
-    cname_record_id=$(get_cname_record_id "$cname")
+    if [ -z "$cname_record_id" ]; then
+        # Try to find it
+        cname_record_id=$(get_cname_record_id "$cname")
+    fi
+    
     if [ -n "$cname_record_id" ]; then
         delete_dns_record "$cname_record_id"
     fi
@@ -1118,7 +1282,7 @@ show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE AUTO-FAILOVER MANAGER v3.0      ║"
+    echo "║    CLOUDFLARE AUTO-FAILOVER MANAGER v3.1      ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
     echo -e "║  ${GREEN}1.${NC} Complete Setup (Create Dual-IP CNAME)      ║"
@@ -1181,6 +1345,10 @@ manual_failover_control() {
     backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
     local active_ip
     active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+    local primary_host
+    primary_host=$(echo "$state" | jq -r '.primary_host // empty')
+    local backup_host
+    backup_host=$(echo "$state" | jq -r '.backup_host // empty')
     
     echo
     echo "════════════════════════════════════════════════"
@@ -1192,7 +1360,7 @@ manual_failover_control() {
     echo
     echo "1. Switch to Primary IP ($primary_ip)"
     echo "2. Switch to Backup IP ($backup_ip)"
-    echo "3. Test both IPs (detailed - like Script 1)"
+    echo "3. Test both IPs (detailed)"
     echo "4. Back to main menu"
     echo
     
@@ -1200,31 +1368,31 @@ manual_failover_control() {
     
     case $choice in
         1)
-            local primary_host
-            primary_host=$(echo "$state" | jq -r '.primary_host // empty')
             log "Switching to Primary IP..." "INFO"
-            if update_cname_target "$cname" "$primary_host"; then
+            if update_cname_target_safe "$cname" "$primary_host"; then
                 update_state "active_ip" "$primary_ip"
+                update_state "active_host" "$primary_host"
                 update_state "failure_count" "0"
                 update_state "recovery_count" "0"
+                update_state "last_switch_time" "$(date +%s)"
                 log "Switched to Primary IP ($primary_ip)" "SUCCESS"
             fi
             ;;
         2)
-            local backup_host
-            backup_host=$(echo "$state" | jq -r '.backup_host // empty')
             log "Switching to Backup IP..." "INFO"
-            if update_cname_target "$cname" "$backup_host"; then
+            if update_cname_target_safe "$cname" "$backup_host"; then
                 update_state "active_ip" "$backup_ip"
+                update_state "active_host" "$backup_host"
                 update_state "failure_count" "0"
                 update_state "recovery_count" "0"
+                update_state "last_switch_time" "$(date +%s)"
                 log "Switched to Backup IP ($backup_ip)" "SUCCESS"
             fi
             ;;
         3)
             echo
-            echo "Testing IP connectivity (like Script 1):"
-            echo "----------------------------------------"
+            echo "Testing IP connectivity:"
+            echo "------------------------"
             
             # Test primary
             echo -n "Primary IP ($primary_ip): "
