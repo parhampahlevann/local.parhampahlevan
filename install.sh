@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =====================================================
-# CLOUDFLARE LOAD BALANCER - STABLE MENU VERSION
+# CLOUDFLARE STABLE LOAD BALANCER WITH MENU
 # =====================================================
 
-CONFIG_DIR="$HOME/.cf-lb"
+CONFIG_DIR="$HOME/.cf-stable"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
@@ -18,7 +18,7 @@ BASE_DOMAIN=""
 SUBDOMAIN="app"
 SERVICE_PORT=443
 
-# ---------------- UTILS ----------------
+# ---------------- UTILITIES ----------------
 log() {
   local msg="$1"
   local lvl="${2:-INFO}"
@@ -28,13 +28,13 @@ log() {
   echo "[$ts][$lvl] $msg" >> "$LOG_FILE"
 }
 
+pause() {
+  read -rp "Press Enter to continue..."
+}
+
 ensure_dir() {
   mkdir -p "$CONFIG_DIR"
   touch "$LOG_FILE"
-}
-
-pause() {
-  read -rp "Press Enter to continue..."
 }
 
 # ---------------- CONFIG ----------------
@@ -50,7 +50,7 @@ BASE_DOMAIN="$BASE_DOMAIN"
 SUBDOMAIN="$SUBDOMAIN"
 SERVICE_PORT="$SERVICE_PORT"
 EOF
-  log "Config saved" "SUCCESS"
+  log "Configuration saved" "SUCCESS"
 }
 
 # ---------------- API ----------------
@@ -82,14 +82,17 @@ check_zone() {
 # ---------------- SETUP ----------------
 setup_load_balancer() {
   clear
-  echo "=== Load Balancer Stable Setup ==="
+  echo "======================================"
+  echo "     Stable Load Balancer Setup"
+  echo "======================================"
+  echo
 
   read -rp "Primary IP: " PRIMARY_IP
-  read -rp "Backup IP: " BACKUP_IP
+  read -rp "Backup IP:  " BACKUP_IP
 
   HOSTNAME="${SUBDOMAIN}.${BASE_DOMAIN}"
 
-  echo "Creating health monitor..."
+  log "Creating health monitor..." "INFO"
   MONITOR_ID=$(api POST "/user/load_balancers/monitors" "{
     \"type\":\"tcp\",
     \"interval\":30,
@@ -98,21 +101,21 @@ setup_load_balancer() {
     \"port\":$SERVICE_PORT
   }" | jq -r '.result.id')
 
-  echo "Creating primary pool..."
+  log "Creating primary pool..." "INFO"
   PRIMARY_POOL=$(api POST "/zones/$CF_ZONE_ID/load_balancers/pools" "{
     \"name\":\"primary-pool\",
     \"monitor\":\"$MONITOR_ID\",
     \"origins\":[{\"name\":\"primary\",\"address\":\"$PRIMARY_IP\",\"enabled\":true}]
   }" | jq -r '.result.id')
 
-  echo "Creating backup pool..."
+  log "Creating backup pool..." "INFO"
   BACKUP_POOL=$(api POST "/zones/$CF_ZONE_ID/load_balancers/pools" "{
     \"name\":\"backup-pool\",
     \"monitor\":\"$MONITOR_ID\",
     \"origins\":[{\"name\":\"backup\",\"address\":\"$BACKUP_IP\",\"enabled\":true}]
   }" | jq -r '.result.id')
 
-  echo "Creating Load Balancer DNS..."
+  log "Creating Load Balancer DNS..." "INFO"
   api POST "/zones/$CF_ZONE_ID/load_balancers" "{
     \"name\":\"$HOSTNAME\",
     \"default_pools\":[\"$PRIMARY_POOL\"],
@@ -126,25 +129,37 @@ setup_load_balancer() {
   "hostname":"$HOSTNAME",
   "primary_ip":"$PRIMARY_IP",
   "backup_ip":"$BACKUP_IP",
-  "mode":"load-balancer-stable"
+  "type":"cloudflare-load-balancer"
 }
 EOF
 
-  log "Load Balancer setup completed" "SUCCESS"
+  log "Setup completed successfully" "SUCCESS"
+  echo
+  echo "CNAME / Hostname:"
+  echo "  $HOSTNAME"
+  echo
 }
 
 # ---------------- INFO ----------------
 show_status() {
-  [ -f "$STATE_FILE" ] && jq . "$STATE_FILE" || log "No active setup" "WARN"
+  if [ -f "$STATE_FILE" ]; then
+    jq . "$STATE_FILE"
+  else
+    log "No active setup found" "WARNING"
+  fi
 }
 
 show_hostname() {
-  jq -r '.hostname' "$STATE_FILE" 2>/dev/null || echo "N/A"
+  if [ -f "$STATE_FILE" ]; then
+    jq -r '.hostname' "$STATE_FILE"
+  else
+    echo "N/A"
+  fi
 }
 
 cleanup() {
   rm -f "$STATE_FILE"
-  log "Local state removed (Cloudflare resources kept)" "WARN"
+  log "Local state removed (Cloudflare resources untouched)" "WARNING"
 }
 
 # ---------------- CONFIG MENU ----------------
@@ -156,6 +171,7 @@ configure_api() {
   check_zone || { log "Invalid Zone ID" "ERROR"; return; }
 
   read -rp "Base domain (example.com): " BASE_DOMAIN
+
   read -rp "Subdomain [app]: " tmp
   [ -n "$tmp" ] && SUBDOMAIN="$tmp"
 
@@ -172,9 +188,9 @@ main() {
 
   while true; do
     clear
-    echo "=================================="
-    echo " Cloudflare Stable Load Balancer"
-    echo "=================================="
+    echo "======================================"
+    echo " Cloudflare Stable Load Balancer Menu"
+    echo "======================================"
     echo "1) Complete Setup"
     echo "2) Show Status"
     echo "3) Start Monitor (Disabled)"
@@ -186,15 +202,22 @@ main() {
     echo "9) Exit"
     echo
 
-    read -rp "Select: " c
+    read -rp "Select option (1-9): " c
     case "$c" in
-      1) setup_load_balancer ;;
+      1)
+        if [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${BASE_DOMAIN:-}" ]; then
+          log "API not configured. Please run option 8 first." "ERROR"
+        else
+          setup_load_balancer
+        fi
+        ;;
       2) show_status ;;
-      3|4|5) log "This option is disabled by design" "INFO" ;;
+      3|4|5) log "This option is intentionally disabled" "INFO" ;;
       6) show_hostname ;;
       7) cleanup ;;
       8) configure_api ;;
       9) exit 0 ;;
+      *) log "Invalid option" "ERROR" ;;
     esac
     pause
   done
