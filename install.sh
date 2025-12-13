@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # =============================================
-# CLOUDFLARE DUAL-IP STABLE MANAGER
-# (NO FAILOVER - NO DNS SWITCH - PROXIED)
+# CLOUDFLARE DUAL-IP STABLE (NO PROXY)
 # =============================================
 
 CONFIG_DIR="$HOME/.cf-auto-failover"
@@ -17,9 +16,10 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
+TTL=600   # 10 minutes - key for stability
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
@@ -91,15 +91,7 @@ test_zone() {
 }
 
 # =============================================
-# VALIDATION
-# =============================================
-
-validate_ip() {
-    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-# =============================================
-# DNS (STABLE)
+# DNS
 # =============================================
 
 create_dns_record() {
@@ -111,34 +103,38 @@ create_dns_record() {
   "type": "A",
   "name": "$name",
   "content": "$ip",
-  "ttl": 0,
-  "proxied": true
+  "ttl": $TTL,
+  "proxied": false
 }
 EOF
 )" | jq -e '.success==true' >/dev/null
 }
 
+validate_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 # =============================================
-# SETUP (DUAL ACTIVE - PROXIED)
+# SETUP
 # =============================================
 
 setup_dual_ip() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "   DUAL IP SETUP (STABLE - PROXIED MODE)"
+    echo "   DUAL IP SETUP (NO PROXY - STABLE DNS)"
     echo "════════════════════════════════════════════════"
     echo
 
     local ip1 ip2
 
     while true; do
-        read -rp "First IP: " ip1
+        read -rp "Primary IP: " ip1
         validate_ip "$ip1" && break
         log "Invalid IP" "ERROR"
     done
 
     while true; do
-        read -rp "Second IP: " ip2
+        read -rp "Backup IP: " ip2
         validate_ip "$ip2" && break
         log "Invalid IP" "ERROR"
     done
@@ -147,7 +143,7 @@ setup_dual_ip() {
     id=$(date +%s%N | md5sum | cut -c1-8)
     cname="app-$id.$BASE_HOST"
 
-    log "Creating proxied DNS records (STABLE)..." "INFO"
+    log "Creating stable DNS records (TTL=$TTL)..." "INFO"
 
     create_dns_record "$cname" "$ip1"
     create_dns_record "$cname" "$ip2"
@@ -155,28 +151,28 @@ setup_dual_ip() {
     cat > "$STATE_FILE" <<EOF
 {
   "cname": "$cname",
-  "ip1": "$ip1",
-  "ip2": "$ip2",
-  "mode": "dual-active-proxied"
+  "primary_ip": "$ip1",
+  "backup_ip": "$ip2",
+  "ttl": $TTL,
+  "mode": "dual-dns-stable"
 }
 EOF
 
     echo "$cname" > "$LAST_CNAME_FILE"
 
     echo
-    log "SETUP COMPLETED — CONNECTION WILL NOT DROP" "SUCCESS"
+    log "SETUP COMPLETED — STABLE MODE" "SUCCESS"
     echo
     echo "CNAME:"
     echo -e "  ${GREEN}$cname${NC}"
     echo
-    echo "Backend IPs:"
-    echo "  - $ip1"
-    echo "  - $ip2"
+    echo "IPs:"
+    echo "  - $ip1 (Primary)"
+    echo "  - $ip2 (Backup)"
     echo
-    echo "✔ Cloudflare Proxy: ON"
+    echo "✔ No proxy"
     echo "✔ No DNS switching"
-    echo "✔ No reconnect"
-    echo "✔ Stable WebSocket / TCP / HTTP"
+    echo "✔ Long TTL prevents reconnect"
 }
 
 # =============================================
@@ -188,16 +184,16 @@ show_status() {
 }
 
 show_cname() {
-    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME found" "ERROR"
+    [ -f "$LAST_CNAME_FILE" ] && cat "$LAST_CNAME_FILE" || log "No CNAME" "ERROR"
 }
 
 cleanup() {
     rm -f "$STATE_FILE" "$LAST_CNAME_FILE"
-    log "Local state removed (DNS left intact)" "WARNING"
+    log "Local state removed (DNS untouched)" "WARNING"
 }
 
 # =============================================
-# CONFIG WIZARD
+# CONFIG
 # =============================================
 
 configure_api() {
@@ -207,7 +203,7 @@ configure_api() {
     read -rp "Zone ID: " CF_ZONE_ID
     test_zone || { log "Invalid Zone ID" "ERROR"; return; }
 
-    read -rp "Base domain (example.com): " BASE_HOST
+    read -rp "Base domain: " BASE_HOST
     save_config
 }
 
@@ -222,7 +218,7 @@ main() {
     while true; do
         clear
         echo "════════════════════════════════════"
-        echo "  CLOUDFLARE DUAL IP (STABLE)"
+        echo "  CLOUDFLARE DUAL IP (NO PROXY)"
         echo "════════════════════════════════════"
         echo "1) Complete Setup"
         echo "2) Show Status"
@@ -239,9 +235,7 @@ main() {
         case $c in
             1) setup_dual_ip ;;
             2) show_status ;;
-            3) log "Monitor permanently disabled" "WARNING" ;;
-            4) log "Monitor permanently disabled" "WARNING" ;;
-            5) log "Failover permanently disabled" "WARNING" ;;
+            3|4|5) log "This feature is disabled" "WARNING" ;;
             6) show_cname ;;
             7) cleanup ;;
             8) configure_api ;;
