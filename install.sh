@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE LOAD BALANCER MANAGER v3.0
+# CLOUDFLARE LOAD BALANCER MANAGER v3.1
 # =============================================
 
 set -euo pipefail
@@ -13,16 +13,18 @@ CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
 MONITOR_PID_FILE="$CONFIG_DIR/monitor.pid"
+CNAME_FILE="$CONFIG_DIR/cname.txt"
 
 # Cloudflare API
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 CF_API_TOKEN=""
 CF_ZONE_ID=""
+CF_ACCOUNT_ID=""
 BASE_HOST=""
 
 # Load Balancer Settings
 CHECK_INTERVAL=10        # Health check every 10 seconds
-MONITOR_INTERVAL=60      # Monitor status every 60 seconds
+MONITOR_INTERVAL=30      # Monitor status every 30 seconds
 
 # Colors
 RED='\033[0;31m'
@@ -99,12 +101,27 @@ check_prerequisites() {
         missing=1
     fi
     
+    # Check md5sum
+    if ! command -v md5sum &>/dev/null && ! command -v md5 &>/dev/null; then
+        log "md5sum/md5 is not installed" "WARNING"
+    fi
+    
     if [ $missing -eq 1 ]; then
         log "Please install missing prerequisites first" "ERROR"
         exit 1
     fi
     
     log "All prerequisites are installed" "SUCCESS"
+}
+
+generate_random_id() {
+    if command -v md5sum &>/dev/null; then
+        date +%s%N | md5sum | cut -c1-8
+    elif command -v md5 &>/dev/null; then
+        date +%s%N | md5 | cut -c1-8
+    else
+        date +%s%N | sha256sum | cut -c1-8
+    fi
 }
 
 # =============================================
@@ -115,6 +132,12 @@ load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         # shellcheck source=/dev/null
         source "$CONFIG_FILE" 2>/dev/null || true
+        
+        # Validate required configs
+        if [[ -z "$CF_API_TOKEN" || -z "$CF_ZONE_ID" || -z "$BASE_HOST" ]]; then
+            log "Configuration incomplete. Please run setup again." "WARNING"
+            return 1
+        fi
         return 0
     fi
     return 1
@@ -124,6 +147,7 @@ save_config() {
     cat > "$CONFIG_FILE" << EOF
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
+CF_ACCOUNT_ID="$CF_ACCOUNT_ID"
 BASE_HOST="$BASE_HOST"
 CHECK_INTERVAL="$CHECK_INTERVAL"
 MONITOR_INTERVAL="$MONITOR_INTERVAL"
@@ -139,6 +163,7 @@ save_state() {
     local primary_ip="$5"
     local backup_ip="$6"
     local fqdn="$7"
+    local cname="$8"
     
     cat > "$STATE_FILE" << EOF
 {
@@ -149,10 +174,14 @@ save_state() {
   "primary_ip": "$primary_ip",
   "backup_ip": "$backup_ip",
   "fqdn": "$fqdn",
+  "cname": "$cname",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
   "status": "active"
 }
 EOF
+    
+    # Save CNAME to separate file
+    echo "$cname" > "$CNAME_FILE"
 }
 
 load_state() {
@@ -175,15 +204,25 @@ api_request() {
     local url="${CF_API_BASE}${endpoint}"
     local response
     
+    # Set timeout
+    local timeout=30
+    
     if [ -n "$data" ]; then
-        response=$(curl -s -X "$method" "$url" \
+        response=$(curl -s --max-time "$timeout" -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
             --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
     else
-        response=$(curl -s -X "$method" "$url" \
+        response=$(curl -s --max-time "$timeout" -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
+    fi
+    
+    # Log errors for debugging
+    if ! echo "$response" | jq -e '.success == true' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "Invalid JSON response")
+        log "API request failed: $error_msg" "ERROR" >&2
     fi
     
     echo "$response"
@@ -197,6 +236,7 @@ test_api() {
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         local email
         email=$(echo "$response" | jq -r '.result.email // "Unknown"')
+        CF_ACCOUNT_ID=$(echo "$response" | jq -r '.result.id // ""')
         log "API token is valid (User: $email)" "SUCCESS"
         return 0
     else
@@ -213,6 +253,7 @@ test_zone() {
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         local zone_name
         zone_name=$(echo "$response" | jq -r '.result.name // "Unknown"')
+        CF_ACCOUNT_ID=$(echo "$response" | jq -r '.result.account.id // ""')
         log "Zone access confirmed: $zone_name" "SUCCESS"
         return 0
     else
@@ -237,8 +278,8 @@ configure_api() {
     echo "Get your API token from:"
     echo "https://dash.cloudflare.com/profile/api-tokens"
     echo "Required permissions:"
-    echo "  - Zone.Load Balancer (Edit)"
     echo "  - Zone.DNS (Edit)"
+    echo "  - Account Load Balancers (Edit)"
     echo
     
     while true; do
@@ -281,7 +322,7 @@ configure_api() {
     echo
     echo "Step 3: Base Domain"
     echo "-------------------"
-    echo "Enter your base domain"
+    echo "Enter your base domain (without subdomain)"
     echo "Example: example.com"
     echo
     
@@ -289,6 +330,8 @@ configure_api() {
         read -rp "Enter base domain: " BASE_HOST
         if [ -z "$BASE_HOST" ]; then
             log "Domain cannot be empty" "ERROR"
+        elif [[ "$BASE_HOST" == *"//"* ]] || [[ "$BASE_HOST" == *"www."* ]]; then
+            log "Please enter just the domain name (e.g., example.com)" "ERROR"
         else
             break
         fi
@@ -297,6 +340,7 @@ configure_api() {
     save_config
     echo
     log "Configuration completed successfully!" "SUCCESS"
+    log "Account ID: $CF_ACCOUNT_ID" "INFO"
 }
 
 # =============================================
@@ -320,6 +364,20 @@ validate_ip() {
        [ "$o3" -gt 255 ] || [ "$o3" -lt 0 ] ||
        [ "$o4" -gt 255 ] || [ "$o4" -lt 0 ]; then
         return 1
+    fi
+    
+    # Reserved IP check
+    if [ "$o1" -eq 0 ] || 
+       [ "$o1" -eq 10 ] || 
+       [ "$o1" -eq 127 ] ||
+       ([ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]) ||
+       ([ "$o1" -eq 192 ] && [ "$o2" -eq 168 ]) ||
+       ([ "$o1" -eq 169 ] && [ "$o2" -eq 254 ]); then
+        log "Warning: IP $ip appears to be a private/reserved IP" "WARNING"
+        read -rp "Continue anyway? (y/n): " choice
+        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
     fi
     
     return 0
@@ -356,13 +414,14 @@ create_origin_pool() {
   ],
   "notification_email": "",
   "enabled": true,
-  "monitor": ""
+  "monitor": "",
+  "check_regions": ["WNAM"]
 }
 EOF
 )
     
     local response
-    response=$(api_request "POST" "/accounts/${CF_ZONE_ID}/load_balancers/pools" "$data")
+    response=$(api_request "POST" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools" "$data")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         echo "$response" | jq -r '.result.id'
@@ -389,18 +448,18 @@ create_health_monitor() {
   "retries": 2,
   "interval": $CHECK_INTERVAL,
   "expected_body": "",
-  "expected_codes": "200",
+  "expected_codes": "200,301,302",
   "follow_redirects": true,
   "allow_insecure": false,
   "header": {},
-  "consecutive_up": 2,
-  "consecutive_down": 2
+  "consecutive_up": 1,
+  "consecutive_down": 1
 }
 EOF
 )
     
     local response
-    response=$(api_request "POST" "/accounts/${CF_ZONE_ID}/load_balancers/monitors" "$data")
+    response=$(api_request "POST" "/accounts/${CF_ACCOUNT_ID}/load_balancers/monitors" "$data")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         echo "$response" | jq -r '.result.id'
@@ -438,7 +497,7 @@ create_load_balancer() {
     "default_weight": 1
   },
   "adaptive_routing": {
-    "failover_across_pools": true
+    "failover_across_pools": false
   },
   "location_strategy": {
     "prefer_ecs": "always",
@@ -463,17 +522,16 @@ EOF
     fi
 }
 
-create_dns_record() {
-    local name="$1"
-    local type="$2"
-    local content="$3"
+create_cname_record() {
+    local cname="$1"
+    local target="$2"
     
     local data
     data=$(cat << EOF
 {
-  "type": "$type",
-  "name": "$name",
-  "content": "$content",
+  "type": "CNAME",
+  "name": "$cname",
+  "content": "$target",
   "ttl": 60,
   "proxied": false
 }
@@ -487,7 +545,7 @@ EOF
         echo "$response" | jq -r '.result.id'
         return 0
     else
-        log "Failed to create DNS record" "ERROR"
+        log "Failed to create CNAME record" "ERROR"
         return 1
     fi
 }
@@ -508,6 +566,7 @@ setup_load_balancer() {
     
     echo "Enter IP addresses for load balancing:"
     echo "--------------------------------------"
+    echo
     
     # Primary IP
     while true; do
@@ -517,6 +576,8 @@ setup_load_balancer() {
         fi
         log "Invalid IPv4 address format" "ERROR"
     done
+    
+    echo
     
     # Backup IP
     while true; do
@@ -538,97 +599,118 @@ setup_load_balancer() {
     
     # Generate unique names
     local random_id
-    random_id=$(date +%s%N | md5sum | cut -c1-8)
+    random_id=$(generate_random_id)
     local lb_name="lb-${random_id}"
     local pool_name="pool-${random_id}"
     local monitor_name="monitor-${random_id}"
     local fqdn="${lb_name}.${BASE_HOST}"
+    local cname="app-${random_id}.${BASE_HOST}"
     
     echo
     log "Creating load balancer components..." "INFO"
-    echo
+    echo "======================================"
     
     # Step 1: Create health monitor
-    log "Creating health monitor..." "INFO"
+    log "1. Creating health monitor..." "INFO"
     local monitor_id
     monitor_id=$(create_health_monitor "$monitor_name")
     if [ -z "$monitor_id" ]; then
         log "Failed to create health monitor" "ERROR"
         return 1
     fi
-    log "Health monitor created: $monitor_id" "SUCCESS"
+    log "✓ Health monitor created: $monitor_id" "SUCCESS"
+    sleep 1
     
     # Step 2: Create origin pool
-    log "Creating origin pool..." "INFO"
+    log "2. Creating origin pool..." "INFO"
     local pool_id
     pool_id=$(create_origin_pool "$pool_name" "$primary_ip" "$backup_ip")
     if [ -z "$pool_id" ]; then
         log "Failed to create origin pool" "ERROR"
         # Cleanup monitor
-        api_request "DELETE" "/accounts/${CF_ZONE_ID}/load_balancers/monitors/$monitor_id" > /dev/null
+        api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/load_balancers/monitors/$monitor_id" > /dev/null 2>&1
         return 1
     fi
-    log "Origin pool created: $pool_id" "SUCCESS"
+    log "✓ Origin pool created: $pool_id" "SUCCESS"
+    sleep 1
     
     # Step 3: Create load balancer
-    log "Creating load balancer..." "INFO"
+    log "3. Creating load balancer..." "INFO"
     local lb_id
     lb_id=$(create_load_balancer "$lb_name" "$fqdn" "$pool_id" "$monitor_id")
     if [ -z "$lb_id" ]; then
         log "Failed to create load balancer" "ERROR"
         # Cleanup
-        api_request "DELETE" "/accounts/${CF_ZONE_ID}/load_balancers/pools/$pool_id" > /dev/null
-        api_request "DELETE" "/accounts/${CF_ZONE_ID}/load_balancers/monitors/$monitor_id" > /dev/null
+        api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools/$pool_id" > /dev/null 2>&1
+        api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/load_balancers/monitors/$monitor_id" > /dev/null 2>&1
         return 1
     fi
-    log "Load balancer created: $lb_id" "SUCCESS"
+    log "✓ Load balancer created: $lb_id" "SUCCESS"
+    sleep 2
     
-    # Step 4: Create DNS record (optional - Load Balancer already creates this)
-    log "Creating DNS record..." "INFO"
-    local dns_record_id
-    dns_record_id=$(create_dns_record "$fqdn" "A" "192.0.2.1")  # Dummy IP, LB will handle it
-    if [ -n "$dns_record_id" ]; then
-        log "DNS record created" "SUCCESS"
+    # Step 4: Create CNAME record pointing to load balancer
+    log "4. Creating CNAME record..." "INFO"
+    local cname_record_id
+    cname_record_id=$(create_cname_record "$cname" "$fqdn")
+    if [ -z "$cname_record_id" ]; then
+        log "Warning: Failed to create CNAME record, but load balancer is working" "WARNING"
+    else
+        log "✓ CNAME record created" "SUCCESS"
     fi
     
+    # Wait for propagation
+    log "5. Waiting for DNS propagation..." "INFO"
+    sleep 3
+    
     # Save state
-    save_state "$lb_name" "$lb_id" "$pool_id" "$monitor_id" "$primary_ip" "$backup_ip" "$fqdn"
+    save_state "$lb_name" "$lb_id" "$pool_id" "$monitor_id" "$primary_ip" "$backup_ip" "$fqdn" "$cname"
     
     echo
     echo "════════════════════════════════════════════════"
-    log "LOAD BALANCER SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
+    log "🎉 LOAD BALANCER SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
     echo "════════════════════════════════════════════════"
     echo
-    echo "Your Load Balancer FQDN is:"
-    echo -e "  ${GREEN}$fqdn${NC}"
+    echo "📋 YOUR LOAD BALANCER DETAILS:"
+    echo "──────────────────────────────"
     echo
-    echo "Components Created:"
-    echo "  Load Balancer: $lb_name ($lb_id)"
-    echo "  Origin Pool: $pool_name ($pool_id)"
-    echo "  Health Monitor: $monitor_name ($monitor_id)"
+    echo -e "🌐 ${CYAN}Your CNAME (Use this in your applications):${NC}"
+    echo -e "   ${GREEN}$cname${NC}"
     echo
-    echo "IP Addresses:"
-    echo "  Primary: $primary_ip"
-    echo "  Backup:  $backup_ip"
+    echo -e "🔗 ${CYAN}Load Balancer FQDN:${NC}"
+    echo -e "   $fqdn"
     echo
-    echo "Features:"
-    echo "  ✓ Zero-downtime failover"
-    echo "  ✓ Automatic health checks"
-    echo "  ✓ Traffic distribution"
-    echo "  ✓ Real-time monitoring"
+    echo "🖥️  SERVER IP ADDRESSES:"
+    echo "   Primary: $primary_ip"
+    echo "   Backup:  $backup_ip"
     echo
-    echo "Health Check Settings:"
-    echo "  Interval: ${CHECK_INTERVAL} seconds"
-    echo "  Timeout: 5 seconds"
-    echo "  Retries: 2"
+    echo "⚙️  COMPONENTS CREATED:"
+    echo "   • Load Balancer: $lb_name"
+    echo "   • Origin Pool: $pool_name"
+    echo "   • Health Monitor: $monitor_name"
     echo
-    echo "How it works:"
-    echo "  1. Health monitor checks both servers every ${CHECK_INTERVAL}s"
-    echo "  2. If Primary fails, traffic automatically routes to Backup"
-    echo "  3. When Primary recovers, traffic automatically shifts back"
-    echo "  4. No DNS propagation delays - instant failover"
+    echo "✅ FEATURES:"
+    echo "   ✓ Zero-downtime failover"
+    echo "   ✓ Automatic health checks"
+    echo "   ✓ Real-time monitoring"
+    echo "   ✓ No DNS propagation delays"
     echo
-    echo "Use $fqdn in your applications"
+    echo "📊 HEALTH CHECK SETTINGS:"
+    echo "   • Interval: ${CHECK_INTERVAL} seconds"
+    echo "   • Timeout: 5 seconds"
+    echo "   • Retries: 2"
+    echo
+    echo "🔧 HOW IT WORKS:"
+    echo "   1. Health monitor checks both servers every ${CHECK_INTERVAL}s"
+    echo "   2. If Primary fails, traffic automatically routes to Backup"
+    echo "   3. When Primary recovers, traffic automatically shifts back"
+    echo "   4. All traffic flows through: ${CYAN}$cname → $fqdn → Active Server${NC}"
+    echo
+    echo "🚀 NEXT STEPS:"
+    echo "   1. Use ${GREEN}$cname${NC} in your applications"
+    echo "   2. DNS propagation may take 1-2 minutes"
+    echo "   3. Start monitor service from main menu"
+    echo
+    echo "⚠️  IMPORTANT: Save your CNAME: ${GREEN}$cname${NC}"
     echo
 }
 
@@ -651,11 +733,11 @@ get_load_balancer_status() {
     fi
 }
 
-get_pool_status() {
+get_pool_health() {
     local pool_id="$1"
     
     local response
-    response=$(api_request "GET" "/accounts/${CF_ZONE_ID}/load_balancers/pools/$pool_id/health")
+    response=$(api_request "GET" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools/$pool_id/health")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         echo "$response"
@@ -676,9 +758,11 @@ monitor_service() {
     
     local lb_id
     lb_id=$(echo "$state" | jq -r '.load_balancer_id // empty')
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
     
     if [ -z "$lb_id" ]; then
-        log "No load balancer setup found" "ERROR"
+        log "No load balancer setup found. Please run setup first." "ERROR"
         return 1
     fi
     
@@ -687,14 +771,20 @@ monitor_service() {
     
     log "Load balancer monitor started (PID: $$)" "SUCCESS"
     log "Press Ctrl+C to stop monitoring" "INFO"
+    log "Monitoring CNAME: $cname" "INFO"
     
     # Trap signals
     trap 'log "Monitor service stopped" "INFO"; rm -f "$MONITOR_PID_FILE"; exit 0' INT TERM
     
+    local check_count=0
+    
     # Main monitoring loop
     while true; do
+        check_count=$((check_count + 1))
+        
         echo
-        log "=== Load Balancer Status Check ===" "INFO"
+        log "=== Monitoring Check #$check_count ===" "INFO"
+        log "Time: $(date '+%H:%M:%S')" "INFO"
         
         # Get load balancer status
         local lb_status
@@ -707,7 +797,7 @@ monitor_service() {
             enabled=$(echo "$lb_status" | jq -r '.result.enabled // false')
             
             if [ "$enabled" = "true" ]; then
-                log "Load Balancer '$lb_name': ${GREEN}ENABLED${NC}" "INFO"
+                log "Load Balancer '$lb_name': ${GREEN}ACTIVE${NC}" "INFO"
             else
                 log "Load Balancer '$lb_name': ${RED}DISABLED${NC}" "WARNING"
             fi
@@ -721,32 +811,36 @@ monitor_service() {
         
         if [ -n "$pool_id" ]; then
             local pool_health
-            pool_health=$(get_pool_status "$pool_id")
+            pool_health=$(get_pool_health "$pool_id")
             
             if echo "$pool_health" | jq -e '.success == true' &>/dev/null; then
-                echo "$pool_health" | jq -c '.result.origins[]' | while read -r origin; do
-                    local origin_name
-                    origin_name=$(echo "$origin" | jq -r '.name // "Unknown"')
-                    local origin_address
-                    origin_address=$(echo "$origin" | jq -r '.address // "Unknown"')
-                    local origin_healthy
-                    origin_healthy=$(echo "$origin" | jq -r '.healthy // false')
-                    local origin_enabled
-                    origin_enabled=$(echo "$origin" | jq -r '.enabled // false')
-                    
-                    local status_color="${GREEN}"
-                    local status_text="HEALTHY"
-                    
-                    if [ "$origin_healthy" = "false" ]; then
-                        status_color="${RED}"
-                        status_text="UNHEALTHY"
-                    elif [ "$origin_enabled" = "false" ]; then
-                        status_color="${YELLOW}"
-                        status_text="DISABLED"
-                    fi
-                    
-                    log "  Origin: $origin_name ($origin_address) - ${status_color}${status_text}${NC}" "INFO"
-                done
+                log "Origin Health Status:" "INFO"
+                
+                local origins
+                origins=$(echo "$pool_health" | jq -c '.result.origins[]' 2>/dev/null)
+                
+                if [ -n "$origins" ]; then
+                    while read -r origin; do
+                        local origin_name
+                        origin_name=$(echo "$origin" | jq -r '.name // "Unknown"')
+                        local origin_address
+                        origin_address=$(echo "$origin" | jq -r '.address // "Unknown"')
+                        local origin_healthy
+                        origin_healthy=$(echo "$origin" | jq -r '.healthy // false')
+                        local origin_enabled
+                        origin_enabled=$(echo "$origin" | jq -r '.enabled // false')
+                        
+                        if [ "$origin_healthy" = "true" ] && [ "$origin_enabled" = "true" ]; then
+                            log "  $origin_name ($origin_address): ${GREEN}✓ HEALTHY${NC}" "INFO"
+                        elif [ "$origin_enabled" = "false" ]; then
+                            log "  $origin_name ($origin_address): ${YELLOW}○ DISABLED${NC}" "INFO"
+                        else
+                            log "  $origin_name ($origin_address): ${RED}✗ UNHEALTHY${NC}" "WARNING"
+                        fi
+                    done <<< "$origins"
+                fi
+            else
+                log "Failed to get pool health status" "ERROR"
             fi
         fi
         
@@ -768,10 +862,17 @@ start_monitor() {
         fi
     fi
     
+    # Check if setup exists
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No load balancer setup found. Please run setup first." "ERROR"
+        return 1
+    fi
+    
     # Start monitor in background
     monitor_service &
     
-    log "Monitor service started in background" "SUCCESS"
+    local pid=$!
+    log "Monitor service started in background (PID: $pid)" "SUCCESS"
     log "Check logs at: $LOG_FILE" "INFO"
 }
 
@@ -800,14 +901,16 @@ show_status() {
     local state
     state=$(load_state)
     
-    local fqdn
-    fqdn=$(echo "$state" | jq -r '.fqdn // empty')
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
     
-    if [ -z "$fqdn" ]; then
+    if [ -z "$cname" ]; then
         log "No load balancer setup found. Please run setup first." "ERROR"
         return 1
     fi
     
+    local fqdn
+    fqdn=$(echo "$state" | jq -r '.fqdn // empty')
     local lb_name
     lb_name=$(echo "$state" | jq -r '.load_balancer_name // empty')
     local lb_id
@@ -822,17 +925,24 @@ show_status() {
     echo "           LOAD BALANCER STATUS"
     echo "════════════════════════════════════════════════"
     echo
-    echo -e "FQDN: ${GREEN}$fqdn${NC}"
-    echo -e "Name: $lb_name ($lb_id)"
+    echo -e "📌 ${CYAN}Your CNAME (for applications):${NC}"
+    echo -e "   ${GREEN}$cname${NC}"
     echo
-    echo "IP Addresses:"
-    echo "  Primary: $primary_ip"
-    echo "  Backup:  $backup_ip"
+    echo -e "🔗 ${CYAN}Load Balancer FQDN:${NC}"
+    echo -e "   $fqdn"
+    echo
+    echo -e "🏷️  ${CYAN}Load Balancer Name:${NC}"
+    echo "   $lb_name ($lb_id)"
+    echo
+    echo "🖥️  SERVER IP ADDRESSES:"
+    echo "   Primary: $primary_ip"
+    echo "   Backup:  $backup_ip"
     echo
     
-    # Get current status
+    # Get real-time status
     if [ -n "$lb_id" ]; then
         log "Fetching real-time status..." "INFO"
+        echo
         
         # Get load balancer status
         local lb_status
@@ -843,9 +953,9 @@ show_status() {
             enabled=$(echo "$lb_status" | jq -r '.result.enabled // false')
             
             if [ "$enabled" = "true" ]; then
-                echo -e "Load Balancer Status: ${GREEN}ACTIVE${NC}"
+                echo -e "📊 Load Balancer Status: ${GREEN}ACTIVE${NC}"
             else
-                echo -e "Load Balancer Status: ${RED}INACTIVE${NC}"
+                echo -e "📊 Load Balancer Status: ${RED}INACTIVE${NC}"
             fi
         fi
         
@@ -855,30 +965,35 @@ show_status() {
         
         if [ -n "$pool_id" ]; then
             local pool_health
-            pool_health=$(get_pool_status "$pool_id")
+            pool_health=$(get_pool_health "$pool_id")
             
             if echo "$pool_health" | jq -e '.success == true' &>/dev/null; then
                 echo
-                echo "Origin Health Status:"
+                echo "🩺 ORIGIN HEALTH STATUS:"
                 
-                echo "$pool_health" | jq -c '.result.origins[]' | while read -r origin; do
-                    local origin_name
-                    origin_name=$(echo "$origin" | jq -r '.name // "Unknown"')
-                    local origin_address
-                    origin_address=$(echo "$origin" | jq -r '.address // "Unknown"')
-                    local origin_healthy
-                    origin_healthy=$(echo "$origin" | jq -r '.healthy // false')
-                    local origin_enabled
-                    origin_enabled=$(echo "$origin" | jq -r '.enabled // false')
-                    
-                    if [ "$origin_healthy" = "true" ] && [ "$origin_enabled" = "true" ]; then
-                        echo -e "  $origin_name ($origin_address): ${GREEN}✓ HEALTHY${NC}"
-                    elif [ "$origin_enabled" = "false" ]; then
-                        echo -e "  $origin_name ($origin_address): ${YELLOW}○ DISABLED${NC}"
-                    else
-                        echo -e "  $origin_name ($origin_address): ${RED}✗ UNHEALTHY${NC}"
-                    fi
-                done
+                local origins
+                origins=$(echo "$pool_health" | jq -c '.result.origins[]' 2>/dev/null)
+                
+                if [ -n "$origins" ]; then
+                    while read -r origin; do
+                        local origin_name
+                        origin_name=$(echo "$origin" | jq -r '.name // "Unknown"')
+                        local origin_address
+                        origin_address=$(echo "$origin" | jq -r '.address // "Unknown"')
+                        local origin_healthy
+                        origin_healthy=$(echo "$origin" | jq -r '.healthy // false')
+                        local origin_enabled
+                        origin_enabled=$(echo "$origin" | jq -r '.enabled // false')
+                        
+                        if [ "$origin_healthy" = "true" ] && [ "$origin_enabled" = "true" ]; then
+                            echo -e "   $origin_name ($origin_address): ${GREEN}✓ HEALTHY${NC}"
+                        elif [ "$origin_enabled" = "false" ]; then
+                            echo -e "   $origin_name ($origin_address): ${YELLOW}○ DISABLED${NC}"
+                        else
+                            echo -e "   $origin_name ($origin_address): ${RED}✗ UNHEALTHY${NC}"
+                        fi
+                    done <<< "$origins"
+                fi
             fi
         fi
     fi
@@ -889,17 +1004,67 @@ show_status() {
         local pid
         pid=$(cat "$MONITOR_PID_FILE")
         if ps -p "$pid" &>/dev/null; then
-            echo -e "Monitor: ${GREEN}RUNNING${NC} (PID: $pid)"
+            echo -e "👁️  Monitor Service: ${GREEN}RUNNING${NC} (PID: $pid)"
         else
-            echo -e "Monitor: ${RED}STOPPED${NC}"
+            echo -e "👁️  Monitor Service: ${RED}STOPPED${NC}"
             rm -f "$MONITOR_PID_FILE"
         fi
     else
-        echo -e "Monitor: ${YELLOW}NOT RUNNING${NC}"
+        echo -e "👁️  Monitor Service: ${YELLOW}NOT RUNNING${NC}"
     fi
     
     echo
     echo "════════════════════════════════════════════════"
+}
+
+show_cname() {
+    if [ -f "$CNAME_FILE" ]; then
+        local cname
+        cname=$(cat "$CNAME_FILE")
+        
+        local state
+        state=$(load_state)
+        local fqdn
+        fqdn=$(echo "$state" | jq -r '.fqdn // empty')
+        local primary_ip
+        primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+        local backup_ip
+        backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+        
+        echo
+        echo "════════════════════════════════════════════════"
+        echo "           YOUR LOAD BALANCER CNAME"
+        echo "════════════════════════════════════════════════"
+        echo
+        echo -e "🎯 ${CYAN}Use this CNAME in your applications:${NC}"
+        echo
+        echo -e "   ${GREEN}$cname${NC}"
+        echo
+        echo "🔗 DNS Configuration:"
+        echo "   CNAME: $cname"
+        echo "   Points to: $fqdn (Load Balancer)"
+        echo "   Then to: Primary IP or Backup IP"
+        echo
+        echo "🖥️  Server IPs:"
+        echo "   Primary: $primary_ip"
+        echo "   Backup:  $backup_ip"
+        echo
+        echo "⚡ How it works:"
+        echo "   1. Your application uses: $cname"
+        echo "   2. DNS redirects to Load Balancer: $fqdn"
+        echo "   3. Load Balancer routes to healthy server"
+        echo "   4. Automatic failover if primary fails"
+        echo
+        echo "⏱️  Health Check Settings:"
+        echo "   • Check every: ${CHECK_INTERVAL} seconds"
+        echo "   • Failover: Instant (no DNS delay)"
+        echo "   • Recovery: Automatic"
+        echo
+        echo "📝 Note: DNS propagation may take 1-2 minutes"
+        echo
+    else
+        log "No CNAME found. Please run setup first." "ERROR"
+    fi
 }
 
 # =============================================
@@ -913,7 +1078,7 @@ toggle_origin() {
     
     # First get current pool configuration
     local response
-    response=$(api_request "GET" "/accounts/${CF_ZONE_ID}/load_balancers/pools/$pool_id")
+    response=$(api_request "GET" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools/$pool_id")
     
     if ! echo "$response" | jq -e '.success == true' &>/dev/null; then
         log "Failed to get pool configuration" "ERROR"
@@ -922,10 +1087,10 @@ toggle_origin() {
     
     # Update the specific origin
     local updated_origins
-    updated_origins=$(echo "$response" | jq --arg name "$origin_name" --arg enable "$enable" '
+    updated_origins=$(echo "$response" | jq --arg name "$origin_name" --argjson enable "$enable" '
         .result.origins |= map(
             if .name == $name then
-                .enabled = ($enable == "true")
+                .enabled = $enable
             else
                 .
             end
@@ -942,7 +1107,7 @@ EOF
 )
     
     local update_response
-    update_response=$(api_request "PUT" "/accounts/${CF_ZONE_ID}/load_balancers/pools/$pool_id" "$update_data")
+    update_response=$(api_request "PUT" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools/$pool_id" "$update_data")
     
     if echo "$update_response" | jq -e '.success == true' &>/dev/null; then
         log "Origin '$origin_name' $( [ "$enable" = "true" ] && echo "enabled" || echo "disabled" )" "SUCCESS"
@@ -963,6 +1128,8 @@ manual_control() {
     primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
     local backup_ip
     backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
     
     if [ -z "$pool_id" ]; then
         log "No load balancer setup found" "ERROR"
@@ -974,11 +1141,13 @@ manual_control() {
     echo "           MANUAL ORIGIN CONTROL"
     echo "════════════════════════════════════════════════"
     echo
+    echo "Current CNAME: $cname"
+    echo
     echo "1. Enable Primary Origin ($primary_ip)"
     echo "2. Disable Primary Origin ($primary_ip)"
     echo "3. Enable Backup Origin ($backup_ip)"
     echo "4. Disable Backup Origin ($backup_ip)"
-    echo "5. Test Origins Health"
+    echo "5. View Current Status"
     echo "6. Back to main menu"
     echo
     
@@ -998,35 +1167,7 @@ manual_control() {
             toggle_origin "$pool_id" "backup-server" "false"
             ;;
         5)
-            echo
-            echo "Testing origin connectivity:"
-            echo "---------------------------"
-            
-            # Get current health status
-            local pool_health
-            pool_health=$(get_pool_status "$pool_id")
-            
-            if echo "$pool_health" | jq -e '.success == true' &>/dev/null; then
-                echo "$pool_health" | jq -c '.result.origins[]' | while read -r origin; do
-                    local origin_name
-                    origin_name=$(echo "$origin" | jq -r '.name // "Unknown"')
-                    local origin_address
-                    origin_address=$(echo "$origin" | jq -r '.address // "Unknown"')
-                    local origin_healthy
-                    origin_healthy=$(echo "$origin" | jq -r '.healthy // false')
-                    local origin_enabled
-                    origin_enabled=$(echo "$origin" | jq -r '.enabled // false')
-                    
-                    echo -n "  $origin_name ($origin_address): "
-                    if [ "$origin_healthy" = "true" ] && [ "$origin_enabled" = "true" ]; then
-                        echo -e "${GREEN}✓ HEALTHY${NC}"
-                    elif [ "$origin_enabled" = "false" ]; then
-                        echo -e "${YELLOW}○ DISABLED${NC}"
-                    else
-                        echo -e "${RED}✗ UNHEALTHY${NC}"
-                    fi
-                done
-            fi
+            show_status
             ;;
         6)
             return
@@ -1049,10 +1190,10 @@ cleanup() {
     local state
     state=$(load_state)
     
-    local fqdn
-    fqdn=$(echo "$state" | jq -r '.fqdn // empty')
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
     
-    if [ -z "$fqdn" ]; then
+    if [ -z "$cname" ]; then
         log "No setup found to cleanup" "ERROR"
         return 1
     fi
@@ -1075,37 +1216,57 @@ cleanup() {
     pool_id=$(echo "$state" | jq -r '.pool_id // empty')
     local monitor_id
     monitor_id=$(echo "$state" | jq -r '.monitor_id // empty')
+    local fqdn
+    fqdn=$(echo "$state" | jq -r '.fqdn // empty')
     
     # Delete Load Balancer
     if [ -n "$lb_id" ]; then
         log "Deleting load balancer..." "INFO"
-        api_request "DELETE" "/zones/${CF_ZONE_ID}/load_balancers/$lb_id" > /dev/null
+        api_request "DELETE" "/zones/${CF_ZONE_ID}/load_balancers/$lb_id" > /dev/null 2>&1
+        sleep 1
     fi
     
     # Delete Origin Pool
     if [ -n "$pool_id" ]; then
         log "Deleting origin pool..." "INFO"
-        api_request "DELETE" "/accounts/${CF_ZONE_ID}/load_balancers/pools/$pool_id" > /dev/null
+        api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/load_balancers/pools/$pool_id" > /dev/null 2>&1
+        sleep 1
     fi
     
     # Delete Health Monitor
     if [ -n "$monitor_id" ]; then
         log "Deleting health monitor..." "INFO"
-        api_request "DELETE" "/accounts/${CF_ZONE_ID}/load_balancers/monitors/$monitor_id" > /dev/null
+        api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/load_balancers/monitors/$monitor_id" > /dev/null 2>&1
+        sleep 1
     fi
     
-    # Delete DNS record (if exists)
-    log "Cleaning up DNS records..." "INFO"
-    local dns_response
-    dns_response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=$fqdn")
-    if echo "$dns_response" | jq -e '.success == true and .result | length > 0' &>/dev/null; then
-        local dns_record_id
-        dns_record_id=$(echo "$dns_response" | jq -r '.result[0].id')
-        api_request "DELETE" "/zones/${CF_ZONE_ID}/dns_records/$dns_record_id" > /dev/null
+    # Delete CNAME DNS record
+    if [ -n "$cname" ]; then
+        log "Deleting CNAME record..." "INFO"
+        # Get DNS record ID
+        local dns_response
+        dns_response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=$cname")
+        if echo "$dns_response" | jq -e '.success == true and .result | length > 0' &>/dev/null; then
+            local dns_record_id
+            dns_record_id=$(echo "$dns_response" | jq -r '.result[0].id')
+            api_request "DELETE" "/zones/${CF_ZONE_ID}/dns_records/$dns_record_id" > /dev/null 2>&1
+        fi
+    fi
+    
+    # Delete Load Balancer DNS record
+    if [ -n "$fqdn" ]; then
+        log "Deleting load balancer DNS record..." "INFO"
+        local lb_dns_response
+        lb_dns_response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=$fqdn")
+        if echo "$lb_dns_response" | jq -e '.success == true and .result | length > 0' &>/dev/null; then
+            local lb_dns_record_id
+            lb_dns_record_id=$(echo "$lb_dns_response" | jq -r '.result[0].id')
+            api_request "DELETE" "/zones/${CF_ZONE_ID}/dns_records/$lb_dns_record_id" > /dev/null 2>&1
+        fi
     fi
     
     # Delete state files
-    rm -f "$STATE_FILE" "$MONITOR_PID_FILE"
+    rm -f "$STATE_FILE" "$CNAME_FILE" "$MONITOR_PID_FILE"
     
     log "Cleanup completed!" "SUCCESS"
 }
@@ -1118,7 +1279,7 @@ show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE LOAD BALANCER MANAGER v3.0      ║"
+    echo "║    CLOUDFLARE LOAD BALANCER MANAGER v3.1      ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
     echo -e "║  ${GREEN}1.${NC} Setup Load Balancer (Zero-Downtime)        ║"
@@ -1126,17 +1287,18 @@ show_menu() {
     echo -e "║  ${GREEN}3.${NC} Start Monitor Service                     ║"
     echo -e "║  ${GREEN}4.${NC} Stop Monitor Service                      ║"
     echo -e "║  ${GREEN}5.${NC} Manual Origin Control                     ║"
-    echo -e "║  ${GREEN}6.${NC} Cleanup (Delete All)                      ║"
-    echo -e "║  ${GREEN}7.${NC} Configure API Settings                    ║"
-    echo -e "║  ${GREEN}8.${NC} Exit                                      ║"
+    echo -e "║  ${GREEN}6.${NC} Show My CNAME                             ║"
+    echo -e "║  ${GREEN}7.${NC} Cleanup (Delete All)                      ║"
+    echo -e "║  ${GREEN}8.${NC} Configure API Settings                    ║"
+    echo -e "║  ${GREEN}9.${NC} Exit                                      ║"
     echo "║                                                ║"
     echo "╠════════════════════════════════════════════════╣"
     
     # Show current status
     if [ -f "$STATE_FILE" ]; then
-        local fqdn
-        fqdn=$(jq -r '.fqdn // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        if [ -n "$fqdn" ]; then
+        local cname
+        cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        if [ -n "$cname" ]; then
             local lb_name
             lb_name=$(jq -r '.load_balancer_name // empty' "$STATE_FILE" 2>/dev/null || echo "")
             local monitor_status=""
@@ -1153,8 +1315,8 @@ show_menu() {
                 monitor_status="${YELLOW}○${NC}"
             fi
             
-            echo -e "║  ${CYAN}FQDN: $fqdn${NC}"
-            echo -e "║  ${CYAN}LB: $lb_name ${monitor_status}${NC}"
+            echo -e "║  ${CYAN}CNAME: $cname${NC}"
+            echo -e "║  ${CYAN}Load Balancer: $lb_name ${monitor_status}${NC}"
         fi
     fi
     
@@ -1177,21 +1339,25 @@ main() {
     if load_config; then
         log "Loaded existing configuration" "INFO"
     else
-        log "No configuration found" "INFO"
+        log "No configuration found. Please configure first." "INFO"
     fi
     
     # Main loop
     while true; do
         show_menu
         
-        read -rp "Select option (1-8): " choice
+        read -rp "Select option (1-9): " choice
         
         case $choice in
             1)
                 if load_config; then
-                    setup_load_balancer
+                    if [[ -z "$CF_API_TOKEN" || -z "$CF_ZONE_ID" || -z "$BASE_HOST" ]]; then
+                        log "Configuration incomplete. Please run option 8 first." "ERROR"
+                    else
+                        setup_load_balancer
+                    fi
                 else
-                    log "Please configure API settings first (option 7)" "ERROR"
+                    log "Please configure API settings first (option 8)" "ERROR"
                 fi
                 pause
                 ;;
@@ -1203,7 +1369,7 @@ main() {
                 if load_config; then
                     start_monitor
                 else
-                    log "Please configure API settings first (option 7)" "ERROR"
+                    log "Please configure API settings first (option 8)" "ERROR"
                 fi
                 pause
                 ;;
@@ -1215,25 +1381,30 @@ main() {
                 if load_config; then
                     manual_control
                 else
-                    log "Please configure API settings first (option 7)" "ERROR"
+                    log "Please configure API settings first (option 8)" "ERROR"
                 fi
                 pause
                 ;;
             6)
-                cleanup
+                show_cname
                 pause
                 ;;
             7)
-                configure_api
+                cleanup
+                pause
                 ;;
             8)
+                configure_api
+                pause
+                ;;
+            9)
                 echo
                 log "Goodbye!" "INFO"
                 echo
                 exit 0
                 ;;
             *)
-                log "Invalid option. Please select 1-8." "ERROR"
+                log "Invalid option. Please select 1-9." "ERROR"
                 sleep 1
                 ;;
         esac
