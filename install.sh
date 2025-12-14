@@ -1,80 +1,76 @@
 #!/bin/bash
-set -euo pipefail
-
-# =============================================
-# TCP ZERO-FLAP PROXY INSTALLER
-# =============================================
+set -e
 
 CONFIG_DIR="/etc/tcp-zero-flap"
 CONFIG_FILE="$CONFIG_DIR/config"
 HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+log() { echo "[INFO] $1"; }
+err() { echo "[ERROR] $1"; exit 1; }
 
-log() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-err() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
-
-pause() {
-    read -rp "Press Enter to continue..." _
-}
-
-ensure_root() {
-    [ "$EUID" -ne 0 ] && err "Run as root"
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        err "Run as root: sudo bash $0"
+    fi
 }
 
 install_deps() {
     log "Installing dependencies..."
-    apt update -y
-    apt install -y haproxy iproute2
+    apt update -y || err "apt update failed"
+    apt install -y haproxy || err "haproxy install failed"
 }
 
-save_config() {
+port_free() {
+    ss -lnt | awk '{print $4}' | grep -q ":$1$" && return 1 || return 0
+}
+
+configure() {
+    echo
+    read -rp "Listening port on proxy (e.g. 8443): " LISTEN_PORT
+
+    port_free "$LISTEN_PORT" || err "Port $LISTEN_PORT is already in use"
+
+    echo
+    echo "Primary backend"
+    read -rp "Primary IP: " PRIMARY_IP
+    read -rp "Primary port: " PRIMARY_PORT
+
+    echo
+    echo "Backup backend"
+    read -rp "Backup IP: " BACKUP_IP
+    read -rp "Backup port: " BACKUP_PORT
+
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<EOF
-LISTEN_PORT="$LISTEN_PORT"
-PRIMARY_IP="$PRIMARY_IP"
-PRIMARY_PORT="$PRIMARY_PORT"
-BACKUP_IP="$BACKUP_IP"
-BACKUP_PORT="$BACKUP_PORT"
+LISTEN_PORT=$LISTEN_PORT
+PRIMARY_IP=$PRIMARY_IP
+PRIMARY_PORT=$PRIMARY_PORT
+BACKUP_IP=$BACKUP_IP
+BACKUP_PORT=$BACKUP_PORT
 EOF
 }
 
-load_config() {
-    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-}
+write_haproxy() {
+    source "$CONFIG_FILE"
 
-write_haproxy_config() {
     log "Writing HAProxy config..."
 
     cat > "$HAPROXY_CFG" <<EOF
 global
-    log /dev/log local0
-    log /dev/log local1 notice
     daemon
     maxconn 100000
 
 defaults
-    log global
     mode tcp
-    option tcplog
     timeout connect 5s
     timeout client  1h
     timeout server  1h
 
 frontend tcp_in
     bind 0.0.0.0:${LISTEN_PORT}
-    default_backend tcp_backends
+    default_backend backends
 
-backend tcp_backends
+backend backends
     balance first
     option tcp-check
     default-server inter 3s fall 2 rise 1
@@ -85,81 +81,25 @@ EOF
 }
 
 restart_haproxy() {
+    log "Validating HAProxy config..."
+    haproxy -c -f "$HAPROXY_CFG" || err "Invalid HAProxy config"
+
+    log "Restarting HAProxy..."
     systemctl enable haproxy
-    systemctl restart haproxy
+    systemctl restart haproxy || err "HAProxy failed to start"
     systemctl status haproxy --no-pager
 }
 
-setup_firewall_hint() {
-    echo
-    echo -e "${YELLOW}Firewall Reminder:${NC}"
-    echo "Allow incoming TCP on port $LISTEN_PORT"
-    echo "Example:"
-    echo "  ufw allow $LISTEN_PORT/tcp"
-    echo
-}
-
-configure() {
-    echo
-    echo "════════════════════════════════════════════"
-    echo " TCP ZERO-FLAP PROXY CONFIGURATION"
-    echo "════════════════════════════════════════════"
-    echo
-
-    read -rp "Listening port on proxy (e.g. 443): " LISTEN_PORT
-
-    echo
-    echo "Primary backend (MAIN server)"
-    read -rp "Primary IP: " PRIMARY_IP
-    read -rp "Primary port: " PRIMARY_PORT
-
-    echo
-    echo "Backup backend (ONLY if primary is down)"
-    read -rp "Backup IP: " BACKUP_IP
-    read -rp "Backup port: " BACKUP_PORT
-
-    save_config
-}
-
-show_status() {
-    echo
-    echo "════════════════════════════════════════════"
-    echo " PROXY STATUS"
-    echo "════════════════════════════════════════════"
-    echo
-
-    haproxy -c -f "$HAPROXY_CFG" && echo
-    ss -lntp | grep ":$LISTEN_PORT" || true
-    echo
-}
-
-uninstall() {
-    read -rp "Type DELETE to uninstall: " c
-    [ "$c" != "DELETE" ] && return
-
-    systemctl stop haproxy || true
-    rm -rf "$CONFIG_DIR"
-    log "Configuration removed. HAProxy not uninstalled."
-}
-
 menu() {
-    clear
-    echo "════════════════════════════════════════════"
-    echo " TCP ZERO-FLAP PROXY"
-    echo "════════════════════════════════════════════"
     echo
-    echo "1) Install / Reconfigure"
-    echo "2) Show status"
-    echo "3) Restart HAProxy"
-    echo "4) Uninstall config"
-    echo "5) Exit"
-    echo
+    echo "1) Install / Configure"
+    echo "2) Restart HAProxy"
+    echo "3) Exit"
 }
 
 main() {
-    ensure_root
+    require_root
     install_deps
-    load_config
 
     while true; do
         menu
@@ -167,26 +107,14 @@ main() {
         case "$c" in
             1)
                 configure
-                write_haproxy_config
+                write_haproxy
                 restart_haproxy
-                setup_firewall_hint
-                pause
                 ;;
             2)
-                show_status
-                pause
+                restart_haproxy
                 ;;
             3)
-                restart_haproxy
-                pause
-                ;;
-            4)
-                uninstall
-                pause
-                ;;
-            5)
-                exit
-                ;;
+                exit ;;
         esac
     done
 }
