@@ -848,10 +848,13 @@ update_ip_addresses() {
         fi
     else
         # For weight-based, update the A records
-        local host1 host2 record_id1 record_id2
-        host1="${cname%-*}-a1.${BASE_HOST}"
-        host2="${cname%-*}-a2.${BASE_HOST}"
+        local cname_prefix host1 host2
+        cname_prefix=$(jq -r '.cname // empty' "$STATE_FILE" | cut -d'.' -f1)
+        host1="${cname_prefix}-a1.${BASE_HOST}"
+        host2="${cname_prefix}-a2.${BASE_HOST}"
         
+        # Get current record IDs
+        local record_id1 record_id2
         record_id1=$(get_record_id_by_name "$host1" "A")
         record_id2=$(get_record_id_by_name "$host2" "A")
         
@@ -862,7 +865,7 @@ update_ip_addresses() {
         fi
         
         if [ -n "$record_id2" ]; then
-            delete_dns_record "$record_id2")
+            delete_dns_record "$record_id2"
             create_dns_record "$host2" "A" "$new_ip2"
         fi
         
@@ -953,9 +956,10 @@ show_status() {
                 echo "  $cname → $ip2 (A)"
                 echo "  Traffic: Distributed equally"
             else
-                local host1 host2
-                host1="${cname%-*}-a1.${BASE_HOST}"
-                host2="${cname%-*}-a2.${BASE_HOST}"
+                local cname_prefix host1 host2
+                cname_prefix=$(echo "$cname" | cut -d'.' -f1)
+                host1="${cname_prefix}-a1.${BASE_HOST}"
+                host2="${cname_prefix}-a2.${BASE_HOST}"
                 echo "  $cname → $host1 (CNAME)"
                 echo "  $host1 → $ip1 (A)"
                 echo "  $host2 → $ip2 (A)"
