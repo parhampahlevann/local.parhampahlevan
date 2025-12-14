@@ -1,19 +1,17 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE AUTO-FAILOVER MANAGER v3.0
+# CLOUDFLARE DNS MANAGER v3.0 - STABLE EDITION
 # =============================================
 
 set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.cf-auto-failover"
+CONFIG_DIR="$HOME/.cf-dns-manager"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
-MONITOR_PID_FILE="$CONFIG_DIR/monitor.pid"
-LAST_CNAME_FILE="$CONFIG_DIR/last_cname.txt"
 
 # Cloudflare API
 CF_API_BASE="https://api.cloudflare.com/client/v4"
@@ -21,10 +19,8 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
-# Monitor Settings
-CHECK_INTERVAL=5        # Check every 5 seconds
-FAILURE_THRESHOLD=2     # 2 failures = 10 seconds total
-RECOVERY_THRESHOLD=3    # 3 successful checks = 15 seconds
+# Stable DNS Settings - No auto-failover
+DNS_TTL=300  # 5 minutes TTL for stable DNS
 
 # Colors
 RED='\033[0;31m'
@@ -101,11 +97,6 @@ check_prerequisites() {
         missing=1
     fi
     
-    # Check ping
-    if ! command -v ping &>/dev/null; then
-        log "ping is not installed" "WARNING"
-    fi
-    
     if [ $missing -eq 1 ]; then
         log "Please install missing prerequisites first" "ERROR"
         exit 1
@@ -132,56 +123,25 @@ save_config() {
 CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
-CHECK_INTERVAL="$CHECK_INTERVAL"
-FAILURE_THRESHOLD="$FAILURE_THRESHOLD"
-RECOVERY_THRESHOLD="$RECOVERY_THRESHOLD"
+DNS_TTL="$DNS_TTL"
 EOF
     log "Configuration saved" "SUCCESS"
 }
 
 save_state() {
-    local primary_ip="$1"
-    local backup_ip="$2"
-    local cname="$3"
-    local primary_record="$4"
-    local backup_record="$5"
+    local cname="$1"
+    local ip="$2"
+    local record_id="$3"
     
     cat > "$STATE_FILE" << EOF
 {
-  "primary_ip": "$primary_ip",
-  "backup_ip": "$backup_ip",
   "cname": "$cname",
-  "primary_record": "$primary_record",
-  "backup_record": "$backup_record",
-  "primary_host": "primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/app-//').$BASE_HOST",
-  "backup_host": "backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/app-//').$BASE_HOST",
+  "ip": "$ip",
+  "record_id": "$record_id",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
-  "active_ip": "$primary_ip",
-  "monitoring": true,
-  "failure_count": 0,
-  "recovery_count": 0
+  "type": "CNAME"
 }
 EOF
-}
-
-load_state() {
-    if [ -f "$STATE_FILE" ]; then
-        cat "$STATE_FILE"
-    else
-        echo "{}"
-    fi
-}
-
-update_state() {
-    local key="$1"
-    local value="$2"
-    
-    if [ -f "$STATE_FILE" ]; then
-        local temp_file
-        temp_file=$(mktemp)
-        jq --arg key "$key" --arg value "$value" '.[$key] = $value' "$STATE_FILE" > "$temp_file"
-        mv "$temp_file" "$STATE_FILE"
-    fi
 }
 
 # =============================================
@@ -359,7 +319,7 @@ create_dns_record() {
   "type": "$type",
   "name": "$name",
   "content": "$content",
-  "ttl": 60,
+  "ttl": $DNS_TTL,
   "proxied": false
 }
 EOF
@@ -412,7 +372,7 @@ get_cname_record_id() {
 
 update_cname_target() {
     local cname="$1"
-    local target_host="$2"
+    local target="$2"
     
     # Get existing CNAME record ID
     local record_id
@@ -423,350 +383,310 @@ update_cname_target() {
         return 1
     fi
     
-    # Delete old record
-    delete_dns_record "$record_id"
+    local data
+    data=$(cat << EOF
+{
+  "type": "CNAME",
+  "name": "$cname",
+  "content": "$target",
+  "ttl": $DNS_TTL,
+  "proxied": false
+}
+EOF
+)
     
-    # Create new record with new target
-    local new_record_id
-    new_record_id=$(create_dns_record "$cname" "CNAME" "$target_host")
+    local response
+    response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
     
-    if [ -n "$new_record_id" ]; then
-        log "Updated CNAME: $cname → $target_host" "SUCCESS"
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        log "Updated CNAME: $cname → $target" "SUCCESS"
         return 0
     else
         log "Failed to update CNAME" "ERROR"
+        echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "$response"
         return 1
     fi
 }
 
 # =============================================
-# SETUP DUAL-IP SYSTEM
+# SIMPLE CNAME SETUP (NO AUTO-FAILOVER)
 # =============================================
 
-setup_dual_ip() {
+setup_simple_cname() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          DUAL IP AUTO-FAILOVER SETUP"
+    echo "          SIMPLE CNAME SETUP"
     echo "════════════════════════════════════════════════"
     echo
     
-    # Get IP addresses
-    local primary_ip backup_ip
+    echo "Choose setup type:"
+    echo "1. CNAME to existing hostname (recommended)"
+    echo "2. CNAME to IP address (A record)"
+    echo
     
-    echo "Enter IP addresses for auto-failover:"
-    echo "-------------------------------------"
+    read -rp "Select option: " setup_type
     
-    # Primary IP
+    case $setup_type in
+        1)
+            setup_cname_to_hostname
+            ;;
+        2)
+            setup_cname_to_ip
+            ;;
+        *)
+            log "Invalid option" "ERROR"
+            return 1
+            ;;
+    esac
+}
+
+setup_cname_to_hostname() {
+    local cname_target
+    
+    echo
+    echo "Enter target hostname (where CNAME should point to):"
+    echo "Example: server1.example.com or app.server.com"
+    echo
+    
     while true; do
-        read -rp "Primary IP (main server): " primary_ip
-        if validate_ip "$primary_ip"; then
+        read -rp "Target hostname: " cname_target
+        if [ -z "$cname_target" ]; then
+            log "Target hostname cannot be empty" "ERROR"
+        else
+            break
+        fi
+    done
+    
+    echo
+    echo "Enter CNAME prefix (optional):"
+    echo "Leave empty for random prefix"
+    echo
+    
+    local cname_prefix
+    read -rp "CNAME prefix: " cname_prefix
+    
+    if [ -z "$cname_prefix" ]; then
+        local random_id
+        random_id=$(date +%s%N | md5sum | cut -c1-8)
+        cname_prefix="app-${random_id}"
+    fi
+    
+    local cname="${cname_prefix}.${BASE_HOST}"
+    
+    echo
+    log "Creating CNAME: $cname → $cname_target" "INFO"
+    
+    local record_id
+    record_id=$(create_dns_record "$cname" "CNAME" "$cname_target")
+    
+    if [ -n "$record_id" ]; then
+        save_state "$cname" "$cname_target" "$record_id"
+        
+        echo
+        echo "════════════════════════════════════════════════"
+        log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
+        echo "════════════════════════════════════════════════"
+        echo
+        echo "Your CNAME is:"
+        echo -e "  ${GREEN}$cname${NC}"
+        echo
+        echo "DNS Configuration:"
+        echo "  CNAME: $cname → $cname_target"
+        echo "  TTL: $DNS_TTL seconds"
+        echo
+        echo "DNS propagation may take a few minutes."
+        echo
+    fi
+}
+
+setup_cname_to_ip() {
+    local ip_address
+    
+    echo
+    echo "Enter IP address for A record:"
+    
+    while true; do
+        read -rp "IP Address: " ip_address
+        if validate_ip "$ip_address"; then
             break
         fi
         log "Invalid IPv4 address format" "ERROR"
     done
     
-    # Backup IP
-    while true; do
-        read -rp "Backup IP (failover server): " backup_ip
-        if validate_ip "$backup_ip"; then
-            if [ "$primary_ip" = "$backup_ip" ]; then
-                log "Warning: Primary and Backup IPs are the same!" "WARNING"
-                read -rp "Continue anyway? (y/n): " choice
-                if [[ "$choice" =~ ^[Yy]$ ]]; then
-                    break
-                fi
-            else
-                break
-            fi
-        else
-            log "Invalid IPv4 address format" "ERROR"
-        fi
-    done
-    
-    # Generate unique names
-    local random_id
-    random_id=$(date +%s%N | md5sum | cut -c1-8)
-    local cname="app-${random_id}.${BASE_HOST}"
-    local primary_host="primary-${random_id}.${BASE_HOST}"
-    local backup_host="backup-${random_id}.${BASE_HOST}"
-    
     echo
-    log "Creating DNS records..." "INFO"
+    echo "Enter CNAME prefix (optional):"
+    echo "Leave empty for random prefix"
     echo
     
-    # Create Primary A record
-    log "Creating Primary A record: $primary_host → $primary_ip" "INFO"
-    local primary_record_id
-    primary_record_id=$(create_dns_record "$primary_host" "A" "$primary_ip")
-    if [ -z "$primary_record_id" ]; then
-        log "Failed to create primary A record" "ERROR"
-        return 1
+    local cname_prefix
+    read -rp "CNAME prefix: " cname_prefix
+    
+    if [ -z "$cname_prefix" ]; then
+        local random_id
+        random_id=$(date +%s%N | md5sum | cut -c1-8)
+        cname_prefix="app-${random_id}"
     fi
     
-    # Create Backup A record
-    log "Creating Backup A record: $backup_host → $backup_ip" "INFO"
-    local backup_record_id
-    backup_record_id=$(create_dns_record "$backup_host" "A" "$backup_ip")
-    if [ -z "$backup_record_id" ]; then
-        log "Failed to create backup A record" "ERROR"
-        delete_dns_record "$primary_record_id"
-        return 1
+    local cname="${cname_prefix}.${BASE_HOST}"
+    
+    echo
+    log "Creating CNAME: $cname → $ip_address" "INFO"
+    
+    local record_id
+    record_id=$(create_dns_record "$cname" "A" "$ip_address")
+    
+    if [ -n "$record_id" ]; then
+        save_state "$cname" "$ip_address" "$record_id"
+        
+        echo
+        echo "════════════════════════════════════════════════"
+        log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
+        echo "════════════════════════════════════════════════"
+        echo
+        echo "Your DNS record is:"
+        echo -e "  ${GREEN}$cname${NC} → $ip_address (A record)"
+        echo
+        echo "DNS Configuration:"
+        echo "  Type: A record"
+        echo "  TTL: $DNS_TTL seconds"
+        echo
+        echo "DNS propagation may take a few minutes."
+        echo
     fi
-    
-    # Create CNAME record pointing to primary
-    log "Creating CNAME: $cname → $primary_host" "INFO"
-    local cname_record_id
-    cname_record_id=$(create_dns_record "$cname" "CNAME" "$primary_host")
-    if [ -z "$cname_record_id" ]; then
-        log "Failed to create CNAME record" "ERROR"
-        delete_dns_record "$primary_record_id"
-        delete_dns_record "$backup_record_id"
-        return 1
-    fi
-    
-    # Save state
-    save_state "$primary_ip" "$backup_ip" "$cname" "$primary_record_id" "$backup_record_id"
-    
-    # Save CNAME to file
-    echo "$cname" > "$LAST_CNAME_FILE"
-    
-    echo
-    echo "════════════════════════════════════════════════"
-    log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
-    echo "════════════════════════════════════════════════"
-    echo
-    echo "Your CNAME is:"
-    echo -e "  ${GREEN}$cname${NC}"
-    echo
-    echo "DNS Configuration:"
-    echo "  Primary: $primary_host → $primary_ip"
-    echo "  Backup:  $backup_host → $backup_ip"
-    echo "  CNAME:   $cname → $primary_host"
-    echo
-    echo "Auto-Failover Settings:"
-    echo "  Check interval: ${CHECK_INTERVAL} seconds"
-    echo "  Failover after: $((CHECK_INTERVAL * FAILURE_THRESHOLD)) seconds"
-    echo "  Recovery after: $((CHECK_INTERVAL * RECOVERY_THRESHOLD)) seconds"
-    echo
-    echo "Current traffic is routed to: ${GREEN}PRIMARY IP ($primary_ip)${NC}"
-    echo
-    echo "To start auto-monitoring:"
-    echo "  Run this script → Start Monitor Service"
-    echo
 }
 
 # =============================================
-# MONITORING FUNCTIONS
+# MANUAL DNS MANAGEMENT
 # =============================================
 
-check_ip_health() {
-    local ip="$1"
+manual_dns_update() {
+    echo
+    echo "════════════════════════════════════════════════"
+    echo "           MANUAL DNS UPDATE"
+    echo "════════════════════════════════════════════════"
+    echo
     
-    # Try ping first
-    if command -v ping &>/dev/null; then
-        if ping -c 1 -W 1 "$ip" &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
+    echo "This feature allows you to manually update DNS records."
+    echo "Useful for maintenance or planned changes."
+    echo
     
-    # Fallback: try curl on port 80
-    if command -v curl &>/dev/null; then
-        if curl -s --max-time 2 "http://$ip" &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
+    echo "1. Update CNAME target"
+    echo "2. Create new DNS record"
+    echo "3. Delete DNS record"
+    echo "4. Back to main menu"
+    echo
     
-    # Try netcat on port 80
-    if command -v nc &>/dev/null; then
-        if nc -z -w 1 "$ip" 80 &>/dev/null; then
-            return 0  # Success
-        fi
-    fi
+    read -rp "Select option: " choice
     
-    return 1  # All checks failed
+    case $choice in
+        1)
+            update_cname_manual
+            ;;
+        2)
+            create_record_manual
+            ;;
+        3)
+            delete_record_manual
+            ;;
+        4)
+            return
+            ;;
+        *)
+            log "Invalid option" "ERROR"
+            ;;
+    esac
 }
 
-perform_failover() {
-    local state
-    state=$(load_state)
+update_cname_manual() {
+    echo
+    read -rp "Enter CNAME to update (e.g., app.example.com): " cname
+    read -rp "Enter new target (e.g., new-server.example.com): " target
     
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    local backup_host
-    backup_host=$(echo "$state" | jq -r '.backup_host // empty')
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found for failover" "ERROR"
-        return 1
+    if [ -z "$cname" ] || [ -z "$target" ]; then
+        log "CNAME and target cannot be empty" "ERROR"
+        return
     fi
     
-    log "Primary IP ($primary_ip) is down! Initiating failover..." "WARNING"
-    log "Switching CNAME to backup: $cname → $backup_host" "INFO"
+    log "Updating CNAME: $cname → $target" "INFO"
     
-    if update_cname_target "$cname" "$backup_host"; then
-        update_state "active_ip" "$backup_ip"
-        update_state "failure_count" "0"
-        update_state "recovery_count" "0"
-        log "Failover completed! Now using Backup IP ($backup_ip)" "SUCCESS"
-        return 0
-    else
-        log "Failed to perform failover" "ERROR"
-        return 1
+    if update_cname_target "$cname" "$target"; then
+        log "CNAME updated successfully" "SUCCESS"
     fi
 }
 
-perform_recovery() {
-    local state
-    state=$(load_state)
+create_record_manual() {
+    echo
+    echo "Select record type:"
+    echo "1. A record"
+    echo "2. CNAME record"
+    echo "3. MX record"
+    echo "4. TXT record"
+    echo
     
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    local primary_host
-    primary_host=$(echo "$state" | jq -r '.primary_host // empty')
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    read -rp "Select type: " record_type_choice
     
-    if [ -z "$cname" ]; then
-        log "No setup found for recovery" "ERROR"
-        return 1
+    case $record_type_choice in
+        1) record_type="A" ;;
+        2) record_type="CNAME" ;;
+        3) record_type="MX" ;;
+        4) record_type="TXT" ;;
+        *) log "Invalid type" "ERROR"; return ;;
+    esac
+    
+    read -rp "Enter record name (e.g., subdomain.example.com): " name
+    read -rp "Enter record content: " content
+    
+    if [ -z "$name" ] || [ -z "$content" ]; then
+        log "Name and content cannot be empty" "ERROR"
+        return
     fi
     
-    log "Primary IP ($primary_ip) is healthy again! Switching back..." "INFO"
-    log "Switching CNAME to primary: $cname → $primary_host" "INFO"
+    log "Creating $record_type record: $name → $content" "INFO"
     
-    if update_cname_target "$cname" "$primary_host"; then
-        update_state "active_ip" "$primary_ip"
-        update_state "failure_count" "0"
-        update_state "recovery_count" "0"
-        log "Recovery completed! Now using Primary IP ($primary_ip)" "SUCCESS"
-        return 0
-    else
-        log "Failed to perform recovery" "ERROR"
-        return 1
+    local record_id
+    record_id=$(create_dns_record "$name" "$record_type" "$content")
+    
+    if [ -n "$record_id" ]; then
+        log "Record created successfully" "SUCCESS"
     fi
 }
 
-monitor_service() {
-    log "Starting auto-monitor service..." "INFO"
-    log "Monitoring interval: ${CHECK_INTERVAL} seconds" "INFO"
+delete_record_manual() {
+    echo
+    echo "WARNING: This will permanently delete a DNS record!"
+    echo
     
-    # Load initial state
-    local state
-    state=$(load_state)
+    read -rp "Enter record name to delete (e.g., subdomain.example.com): " name
     
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found. Please run setup first." "ERROR"
-        return 1
+    if [ -z "$name" ]; then
+        log "Record name cannot be empty" "ERROR"
+        return
     fi
     
-    # Save PID
-    echo $$ > "$MONITOR_PID_FILE"
+    # Get record ID
+    local response
+    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=${name}")
     
-    log "Auto-monitor service started (PID: $$)" "SUCCESS"
-    log "Press Ctrl+C to stop monitoring" "INFO"
-    
-    # Trap signals
-    trap 'log "Monitor service stopped" "INFO"; rm -f "$MONITOR_PID_FILE"; exit 0' INT TERM
-    
-    # Main monitoring loop
-    while true; do
-        state=$(load_state)
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        local record_id
+        record_id=$(echo "$response" | jq -r '.result[0].id // empty')
         
-        local primary_ip
-        primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-        local backup_ip
-        backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-        local active_ip
-        active_ip=$(echo "$state" | jq -r '.active_ip // empty')
-        local failure_count
-        failure_count=$(echo "$state" | jq -r '.failure_count // 0')
-        local recovery_count
-        recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
+        if [ -z "$record_id" ]; then
+            log "Record not found: $name" "ERROR"
+            return
+        fi
         
-        # Check primary IP health
-        if check_ip_health "$primary_ip"; then
-            # Primary is healthy
-            update_state "failure_count" "0"
-            
-            # If currently on backup and primary is healthy, start recovery count
-            if [ "$active_ip" = "$backup_ip" ]; then
-                local new_recovery_count=$((recovery_count + 1))
-                update_state "recovery_count" "$new_recovery_count"
-                
-                log "Primary IP ($primary_ip) is healthy. Recovery count: $new_recovery_count/$RECOVERY_THRESHOLD" "INFO"
-                
-                # Check if we should switch back to primary
-                if [ "$new_recovery_count" -ge "$RECOVERY_THRESHOLD" ]; then
-                    perform_recovery
-                fi
-            else
-                # Reset recovery count if already on primary
-                update_state "recovery_count" "0"
+        read -rp "Are you sure you want to delete $name? (type 'DELETE' to confirm): " confirm
+        
+        if [ "$confirm" = "DELETE" ]; then
+            if delete_dns_record "$record_id"; then
+                log "Record deleted successfully" "SUCCESS"
             fi
         else
-            # Primary is down
-            local new_failure_count=$((failure_count + 1))
-            update_state "failure_count" "$new_failure_count"
-            
-            log "Primary IP ($primary_ip) is down. Failure count: $new_failure_count/$FAILURE_THRESHOLD" "WARNING"
-            
-            # Check if we should switch to backup
-            if [ "$new_failure_count" -ge "$FAILURE_THRESHOLD" ] && [ "$active_ip" = "$primary_ip" ]; then
-                perform_failover
-            fi
-            
-            # Reset recovery count when primary is down
-            update_state "recovery_count" "0"
+            log "Deletion cancelled" "INFO"
         fi
-        
-        # Sleep before next check
-        sleep "$CHECK_INTERVAL"
-    done
-}
-
-start_monitor() {
-    # Check if monitor is already running
-    if [ -f "$MONITOR_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
-        if ps -p "$pid" &>/dev/null; then
-            log "Monitor service is already running (PID: $pid)" "INFO"
-            return 0
-        else
-            rm -f "$MONITOR_PID_FILE"
-        fi
-    fi
-    
-    # Start monitor in background
-    monitor_service &
-    
-    log "Monitor service started in background" "SUCCESS"
-    log "Check logs at: $LOG_FILE" "INFO"
-}
-
-stop_monitor() {
-    if [ -f "$MONITOR_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$MONITOR_PID_FILE")
-        
-        if kill "$pid" 2>/dev/null; then
-            log "Stopped monitor service (PID: $pid)" "SUCCESS"
-        else
-            log "Monitor service was not running" "INFO"
-        fi
-        
-        rm -f "$MONITOR_PID_FILE"
     else
-        log "Monitor service is not running" "INFO"
+        log "Failed to find record" "ERROR"
     fi
 }
 
@@ -775,84 +695,47 @@ stop_monitor() {
 # =============================================
 
 show_status() {
-    local state
-    state=$(load_state)
-    
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No dual-IP setup found. Please run setup first." "ERROR"
-        return 1
-    fi
-    
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-    local active_ip
-    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
-    local failure_count
-    failure_count=$(echo "$state" | jq -r '.failure_count // 0')
-    local recovery_count
-    recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
-    
     echo
     echo "════════════════════════════════════════════════"
     echo "           CURRENT STATUS"
     echo "════════════════════════════════════════════════"
     echo
-    echo -e "CNAME: ${GREEN}$cname${NC}"
-    echo
-    echo "IP Addresses:"
     
-    if [ "$active_ip" = "$primary_ip" ]; then
-        echo -e "  Primary: $primary_ip ${GREEN}[ACTIVE]${NC}"
-        echo -e "  Backup:  $backup_ip"
-        echo -e "  Status: ${GREEN}Normal operation${NC}"
-    else
-        echo -e "  Primary: $primary_ip ${RED}[DOWN]${NC}"
-        echo -e "  Backup:  $backup_ip ${GREEN}[ACTIVE - FAILOVER]${NC}"
-        echo -e "  Status: ${YELLOW}Failover active${NC}"
-    fi
-    
-    echo
-    echo "Monitor Counters:"
-    echo "  Failures: $failure_count/$FAILURE_THRESHOLD"
-    echo "  Recovery: $recovery_count/$RECOVERY_THRESHOLD"
-    echo
-    
-    # Check monitor status
-    if [ -f "$MONITOR_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$MONITOR_PID_FILE")
-        if ps -p "$pid" &>/dev/null; then
-            echo -e "Monitor: ${GREEN}RUNNING${NC} (PID: $pid)"
-        else
-            echo -e "Monitor: ${RED}STOPPED${NC}"
-            rm -f "$MONITOR_PID_FILE"
+    if [ -f "$STATE_FILE" ]; then
+        local cname ip record_id created_at
+        cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        ip=$(jq -r '.ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        record_id=$(jq -r '.record_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        created_at=$(jq -r '.created_at // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        type=$(jq -r '.type // "CNAME"' "$STATE_FILE" 2>/dev/null || echo "CNAME")
+        
+        if [ -n "$cname" ]; then
+            echo -e "${GREEN}Active DNS Record:${NC}"
+            echo "  Name: $cname"
+            echo "  Type: $type"
+            echo "  Target: $ip"
+            echo "  Created: $created_at"
+            echo "  Record ID: $record_id"
+            echo
         fi
     else
-        echo -e "Monitor: ${YELLOW}NOT RUNNING${NC}"
+        echo -e "${YELLOW}No active DNS record found${NC}"
+        echo
     fi
     
-    echo
-    echo "Health Check:"
-    
-    # Check primary
-    echo -n "  Primary ($primary_ip): "
-    if check_ip_health "$primary_ip"; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
+    # Test API connectivity
+    echo -e "${CYAN}API Status:${NC}"
+    if test_api; then
+        echo -e "  Connection: ${GREEN}✓ OK${NC}"
     else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
+        echo -e "  Connection: ${RED}✗ FAILED${NC}"
     fi
     
-    # Check backup
-    echo -n "  Backup ($backup_ip): "
-    if check_ip_health "$backup_ip"; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
+    # Test Zone access
+    if test_zone; then
+        echo -e "  Zone Access: ${GREEN}✓ OK${NC}"
     else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
+        echo -e "  Zone Access: ${RED}✗ FAILED${NC}"
     fi
     
     echo
@@ -860,27 +743,26 @@ show_status() {
 }
 
 show_cname() {
-    if [ -f "$LAST_CNAME_FILE" ]; then
+    if [ -f "$STATE_FILE" ]; then
         local cname
-        cname=$(cat "$LAST_CNAME_FILE")
+        cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
         
-        echo
-        echo "════════════════════════════════════════════════"
-        echo "           YOUR CNAME"
-        echo "════════════════════════════════════════════════"
-        echo
-        echo -e "  ${GREEN}$cname${NC}"
-        echo
-        echo "Use this CNAME in your applications."
-        echo "DNS propagation may take 1-2 minutes."
-        echo
-        echo "Auto-failover will:"
-        echo "  1. Monitor Primary IP every ${CHECK_INTERVAL}s"
-        echo "  2. Switch to Backup after $((CHECK_INTERVAL * FAILURE_THRESHOLD))s of downtime"
-        echo "  3. Switch back to Primary after $((CHECK_INTERVAL * RECOVERY_THRESHOLD))s of stability"
-        echo
+        if [ -n "$cname" ]; then
+            echo
+            echo "════════════════════════════════════════════════"
+            echo "           YOUR DNS RECORD"
+            echo "════════════════════════════════════════════════"
+            echo
+            echo -e "  ${GREEN}$cname${NC}"
+            echo
+            echo "Use this record in your applications."
+            echo "DNS propagation may take a few minutes."
+            echo
+        else
+            log "No DNS record found. Please run setup first." "ERROR"
+        fi
     else
-        log "No CNAME found. Please run setup first." "ERROR"
+        log "No DNS record found. Please run setup first." "ERROR"
     fi
 }
 
@@ -890,19 +772,27 @@ show_cname() {
 
 cleanup() {
     echo
-    log "WARNING: This will delete ALL created DNS records!" "WARNING"
+    log "WARNING: This will delete the active DNS record!" "WARNING"
     echo
     
-    local state
-    state=$(load_state)
-    
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found to cleanup" "ERROR"
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No active record found to cleanup" "ERROR"
         return 1
     fi
+    
+    local cname record_id
+    cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
+    record_id=$(jq -r '.record_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
+    
+    if [ -z "$cname" ]; then
+        log "No active record found" "ERROR"
+        return 1
+    fi
+    
+    echo "Record to delete:"
+    echo "  CNAME: $cname"
+    echo "  Record ID: $record_id"
+    echo
     
     read -rp "Are you sure? Type 'DELETE' to confirm: " confirm
     if [ "$confirm" != "DELETE" ]; then
@@ -910,35 +800,14 @@ cleanup() {
         return 0
     fi
     
-    # Stop monitor first
-    stop_monitor
+    log "Deleting DNS record..." "INFO"
     
-    log "Deleting DNS records..." "INFO"
-    
-    # Get record IDs from state
-    local primary_record
-    primary_record=$(echo "$state" | jq -r '.primary_record // empty')
-    local backup_record
-    backup_record=$(echo "$state" | jq -r '.backup_record // empty')
-    
-    # Delete CNAME record
-    local cname_record_id
-    cname_record_id=$(get_cname_record_id "$cname")
-    if [ -n "$cname_record_id" ]; then
-        delete_dns_record "$cname_record_id"
+    if [ -n "$record_id" ]; then
+        delete_dns_record "$record_id"
     fi
     
-    # Delete A records
-    if [ -n "$primary_record" ]; then
-        delete_dns_record "$primary_record"
-    fi
-    
-    if [ -n "$backup_record" ]; then
-        delete_dns_record "$backup_record"
-    fi
-    
-    # Delete state files
-    rm -f "$STATE_FILE" "$LAST_CNAME_FILE" "$MONITOR_PID_FILE"
+    # Delete state file
+    rm -f "$STATE_FILE"
     
     log "Cleanup completed!" "SUCCESS"
 }
@@ -951,18 +820,16 @@ show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE AUTO-FAILOVER MANAGER v3.0      ║"
+    echo "║    CLOUDFLARE DNS MANAGER v3.0 - STABLE      ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
-    echo -e "║  ${GREEN}1.${NC} Complete Setup (Create Dual-IP CNAME)      ║"
-    echo -e "║  ${GREEN}2.${NC} Show Current Status                       ║"
-    echo -e "║  ${GREEN}3.${NC} Start Auto-Monitor Service                ║"
-    echo -e "║  ${GREEN}4.${NC} Stop Auto-Monitor Service                 ║"
-    echo -e "║  ${GREEN}5.${NC} Manual Failover Control                   ║"
-    echo -e "║  ${GREEN}6.${NC} Show My CNAME                             ║"
-    echo -e "║  ${GREEN}7.${NC} Cleanup (Delete All)                      ║"
-    echo -e "║  ${GREEN}8.${NC} Configure API Settings                    ║"
-    echo -e "║  ${GREEN}9.${NC} Exit                                      ║"
+    echo -e "║  ${GREEN}1.${NC} Create Simple DNS Record                 ║"
+    echo -e "║  ${GREEN}2.${NC} Show Current Status                      ║"
+    echo -e "║  ${GREEN}3.${NC} Manual DNS Update                        ║"
+    echo -e "║  ${GREEN}4.${NC} Show My DNS Record                       ║"
+    echo -e "║  ${GREEN}5.${NC} Cleanup (Delete Record)                  ║"
+    echo -e "║  ${GREEN}6.${NC} Configure API Settings                   ║"
+    echo -e "║  ${GREEN}7.${NC} Exit                                     ║"
     echo "║                                                ║"
     echo "╠════════════════════════════════════════════════╣"
     
@@ -971,111 +838,14 @@ show_menu() {
         local cname
         cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
         if [ -n "$cname" ]; then
-            local active_ip
-            active_ip=$(jq -r '.active_ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
-            local monitor_status=""
-            
-            if [ -f "$MONITOR_PID_FILE" ]; then
-                local pid
-                pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null || echo "")
-                if ps -p "$pid" &>/dev/null; then
-                    monitor_status="${GREEN}●${NC}"
-                else
-                    monitor_status="${RED}●${NC}"
-                fi
-            else
-                monitor_status="${YELLOW}○${NC}"
-            fi
-            
-            echo -e "║  ${CYAN}CNAME: $cname${NC}"
-            echo -e "║  ${CYAN}Active IP: $active_ip ${monitor_status}${NC}"
+            local ip
+            ip=$(jq -r '.ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
+            echo -e "║  ${CYAN}Active: $cname → $ip${NC}"
         fi
     fi
     
     echo "╚════════════════════════════════════════════════╝"
     echo
-}
-
-manual_failover_control() {
-    local state
-    state=$(load_state)
-    
-    local cname
-    cname=$(echo "$state" | jq -r '.cname // empty')
-    
-    if [ -z "$cname" ]; then
-        log "No setup found. Please run setup first." "ERROR"
-        return 1
-    fi
-    
-    local primary_ip
-    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
-    local backup_ip
-    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
-    local active_ip
-    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
-    
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "           MANUAL FAILOVER CONTROL"
-    echo "════════════════════════════════════════════════"
-    echo
-    echo "Current CNAME: $cname"
-    echo "Active IP: $active_ip"
-    echo
-    echo "1. Switch to Primary IP ($primary_ip)"
-    echo "2. Switch to Backup IP ($backup_ip)"
-    echo "3. Test both IPs"
-    echo "4. Back to main menu"
-    echo
-    
-    read -rp "Select option: " choice
-    
-    case $choice in
-        1)
-            local primary_host
-            primary_host=$(echo "$state" | jq -r '.primary_host // empty')
-            log "Switching to Primary IP..." "INFO"
-            if update_cname_target "$cname" "$primary_host"; then
-                update_state "active_ip" "$primary_ip"
-                update_state "failure_count" "0"
-                update_state "recovery_count" "0"
-                log "Switched to Primary IP ($primary_ip)" "SUCCESS"
-            fi
-            ;;
-        2)
-            local backup_host
-            backup_host=$(echo "$state" | jq -r '.backup_host // empty')
-            log "Switching to Backup IP..." "INFO"
-            if update_cname_target "$cname" "$backup_host"; then
-                update_state "active_ip" "$backup_ip"
-                update_state "failure_count" "0"
-                update_state "recovery_count" "0"
-                log "Switched to Backup IP ($backup_ip)" "SUCCESS"
-            fi
-            ;;
-        3)
-            echo
-            echo "Testing IP connectivity:"
-            echo "------------------------"
-            echo -n "Primary IP ($primary_ip): "
-            if check_ip_health "$primary_ip"; then
-                echo -e "${GREEN}✓ HEALTHY${NC}"
-            else
-                echo -e "${RED}✗ UNHEALTHY${NC}"
-            fi
-            
-            echo -n "Backup IP ($backup_ip): "
-            if check_ip_health "$backup_ip"; then
-                echo -e "${GREEN}✓ HEALTHY${NC}"
-            else
-                echo -e "${RED}✗ UNHEALTHY${NC}"
-            fi
-            ;;
-        4)
-            return
-            ;;
-    esac
 }
 
 # =============================================
@@ -1100,14 +870,14 @@ main() {
     while true; do
         show_menu
         
-        read -rp "Select option (1-9): " choice
+        read -rp "Select option (1-7): " choice
         
         case $choice in
             1)
                 if load_config; then
-                    setup_dual_ip
+                    setup_simple_cname
                 else
-                    log "Please configure API settings first (option 8)" "ERROR"
+                    log "Please configure API settings first (option 6)" "ERROR"
                 fi
                 pause
                 ;;
@@ -1117,43 +887,31 @@ main() {
                 ;;
             3)
                 if load_config; then
-                    start_monitor
+                    manual_dns_update
                 else
-                    log "Please configure API settings first (option 8)" "ERROR"
+                    log "Please configure API settings first (option 6)" "ERROR"
                 fi
                 pause
                 ;;
             4)
-                stop_monitor
-                pause
-                ;;
-            5)
-                if load_config; then
-                    manual_failover_control
-                else
-                    log "Please configure API settings first (option 8)" "ERROR"
-                fi
-                pause
-                ;;
-            6)
                 show_cname
                 pause
                 ;;
-            7)
+            5)
                 cleanup
                 pause
                 ;;
-            8)
+            6)
                 configure_api
                 ;;
-            9)
+            7)
                 echo
                 log "Goodbye!" "INFO"
                 echo
                 exit 0
                 ;;
             *)
-                log "Invalid option. Please select 1-9." "ERROR"
+                log "Invalid option. Please select 1-7." "ERROR"
                 sleep 1
                 ;;
         esac
