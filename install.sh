@@ -1,17 +1,19 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE DUAL-IP DNS MANAGER v3.0
+# CLOUDFLARE SMART LOAD BALANCER v4.0
 # =============================================
 
 set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.cf-dualip-dns"
+CONFIG_DIR="$HOME/.cf-smart-lb"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
+HEALTH_LOG="$CONFIG_DIR/health.log"
+LOCK_FILE="/tmp/cf-lb.lock"
 
 # Cloudflare API
 CF_API_BASE="https://api.cloudflare.com/client/v4"
@@ -19,11 +21,22 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
-# Stable DNS Settings
-DNS_TTL=120  # 2 minutes TTL for better propagation
+# Smart Load Balancer Settings
+PRIMARY_IP=""
+BACKUP_IP=""
+CNAME=""
+DNS_TTL=60  # 1 minute TTL for fast failover
 
-# Load Balancing Strategy
-LB_STRATEGY="round-robin"  # Options: round-robin, weight-based
+# Health Check Settings
+HEALTH_CHECK_INTERVAL=30  # Check every 30 seconds (not too frequent)
+HEALTH_CHECK_TIMEOUT=5    # 5 second timeout per check
+MAX_FAILURES=3            # 3 failures = 90 seconds downtime before failover
+RECOVERY_THRESHOLD=5      # 5 successful checks = 150 seconds before recovery
+
+# Performance Settings
+ENABLE_PERFORMANCE_MONITOR=true
+MIN_RESPONSE_TIME_MS=100
+MAX_RESPONSE_TIME_MS=2000
 
 # Colors
 RED='\033[0;31m'
@@ -32,7 +45,41 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
+ORANGE='\033[0;33m'
 NC='\033[0m'
+
+# =============================================
+# LOCK MANAGEMENT (Prevent Multiple Instances)
+# =============================================
+
+acquire_lock() {
+    local max_retries=10
+    local retry_count=0
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
+            trap 'release_lock' EXIT
+            return 0
+        fi
+        
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$LOCK_FILE"
+        fi
+        
+        sleep 1
+        retry_count=$((retry_count + 1))
+    done
+    
+    log "Could not acquire lock after $max_retries attempts" "ERROR"
+    return 1
+}
+
+release_lock() {
+    rm -f "$LOCK_FILE"
+}
 
 # =============================================
 # LOGGING FUNCTIONS
@@ -61,8 +108,14 @@ log() {
             echo -e "${CYAN}[$timestamp] [INFO]${NC} $msg"
             echo "[$timestamp] [INFO] $msg" >> "$LOG_FILE"
             ;;
+        "HEALTH")
+            echo -e "${BLUE}[$timestamp] [HEALTH]${NC} $msg" >> "$HEALTH_LOG"
+            ;;
         "DEBUG")
-            echo -e "${BLUE}[$timestamp] [DEBUG]${NC} $msg" >> "$LOG_FILE"
+            echo -e "${PURPLE}[$timestamp] [DEBUG]${NC} $msg" >> "$LOG_FILE"
+            ;;
+        "PERF")
+            echo -e "${ORANGE}[$timestamp] [PERF]${NC} $msg" >> "$LOG_FILE"
             ;;
         *)
             echo "[$timestamp] [$level] $msg"
@@ -83,6 +136,7 @@ pause() {
 ensure_dir() {
     mkdir -p "$CONFIG_DIR"
     touch "$LOG_FILE" 2>/dev/null || true
+    touch "$HEALTH_LOG" 2>/dev/null || true
 }
 
 check_prerequisites() {
@@ -104,6 +158,13 @@ check_prerequisites() {
         missing=1
     fi
     
+    # Check timeout
+    if ! command -v timeout &>/dev/null; then
+        log "timeout is not installed" "ERROR"
+        echo "Install with: sudo apt-get install coreutils"
+        missing=1
+    fi
+    
     if [ $missing -eq 1 ]; then
         log "Please install missing prerequisites first" "ERROR"
         exit 1
@@ -120,6 +181,14 @@ load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         # shellcheck source=/dev/null
         source "$CONFIG_FILE" 2>/dev/null || true
+        
+        # Load additional configs
+        if [ -f "$STATE_FILE" ]; then
+            PRIMARY_IP=$(jq -r '.primary_ip // empty' "$STATE_FILE")
+            BACKUP_IP=$(jq -r '.backup_ip // empty' "$STATE_FILE")
+            CNAME=$(jq -r '.cname // empty' "$STATE_FILE")
+        fi
+        
         return 0
     fi
     return 1
@@ -131,34 +200,73 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 DNS_TTL="$DNS_TTL"
-LB_STRATEGY="$LB_STRATEGY"
+HEALTH_CHECK_INTERVAL="$HEALTH_CHECK_INTERVAL"
+HEALTH_CHECK_TIMEOUT="$HEALTH_CHECK_TIMEOUT"
+MAX_FAILURES="$MAX_FAILURES"
+RECOVERY_THRESHOLD="$RECOVERY_THRESHOLD"
+ENABLE_PERFORMANCE_MONITOR="$ENABLE_PERFORMANCE_MONITOR"
+MIN_RESPONSE_TIME_MS="$MIN_RESPONSE_TIME_MS"
+MAX_RESPONSE_TIME_MS="$MAX_RESPONSE_TIME_MS"
 EOF
     log "Configuration saved" "SUCCESS"
 }
 
 save_state() {
     local cname="$1"
-    local ip1="$2"
-    local ip2="$3"
-    local record_id1="$4"
-    local record_id2="$5"
+    local primary_ip="$2"
+    local backup_ip="$3"
+    local primary_record_id="$4"
+    local backup_record_id="$5"
+    local cname_record_id="$6"
     
     cat > "$STATE_FILE" << EOF
 {
   "cname": "$cname",
-  "ip1": "$ip1",
-  "ip2": "$ip2",
-  "record_id1": "$record_id1",
-  "record_id2": "$record_id2",
+  "primary_ip": "$primary_ip",
+  "backup_ip": "$backup_ip",
+  "primary_record_id": "$primary_record_id",
+  "backup_record_id": "$backup_record_id",
+  "cname_record_id": "$cname_record_id",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
-  "strategy": "$LB_STRATEGY",
-  "active_ips": ["$ip1", "$ip2"],
+  "active_ip": "$primary_ip",
   "health_status": {
-    "$ip1": "unknown",
-    "$ip2": "unknown"
-  }
+    "primary": "unknown",
+    "backup": "unknown"
+  },
+  "failure_count": 0,
+  "recovery_count": 0,
+  "last_health_check": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "total_failovers": 0,
+  "last_failover": null
 }
 EOF
+}
+
+update_state() {
+    local key="$1"
+    local value="$2"
+    
+    if [ -f "$STATE_FILE" ]; then
+        local temp_file
+        temp_file=$(mktemp)
+        jq --arg key "$key" --arg value "$value" '.[$key] = $value' "$STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$STATE_FILE"
+    fi
+}
+
+increment_counter() {
+    local key="$1"
+    
+    if [ -f "$STATE_FILE" ]; then
+        local current_value
+        current_value=$(jq -r ".[\"$key\"] // 0" "$STATE_FILE")
+        local new_value=$((current_value + 1))
+        
+        local temp_file
+        temp_file=$(mktemp)
+        jq --arg key "$key" --argjson new_value "$new_value" '.[$key] = $new_value' "$STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$STATE_FILE"
+    fi
 }
 
 # =============================================
@@ -173,20 +281,24 @@ api_request() {
     local url="${CF_API_BASE}${endpoint}"
     local response
     
-    log "API Request: $method $endpoint" "DEBUG"
-    
     if [ -n "$data" ]; then
         response=$(curl -s -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
+            --max-time 10 \
+            --retry 2 \
+            --retry-delay 1 \
+            --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"API Connection failed"}]}')
     else
         response=$(curl -s -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
+            -H "Content-Type: application/json" \
+            --max-time 10 \
+            --retry 2 \
+            --retry-delay 1 \
+            2>/dev/null || echo '{"success":false,"errors":[{"message":"API Connection failed"}]}')
     fi
     
-    log "API Response: $(echo "$response" | jq -c .)" "DEBUG"
     echo "$response"
 }
 
@@ -293,31 +405,6 @@ configure_api() {
         fi
     done
     
-    echo
-    echo "Step 4: Load Balancing Strategy"
-    echo "-------------------------------"
-    echo "Choose how traffic is distributed:"
-    echo "1. Round Robin (equal distribution)"
-    echo "2. Weight Based (70% primary, 30% backup)"
-    echo
-    
-    while true; do
-        read -rp "Select strategy (1-2): " strategy_choice
-        case $strategy_choice in
-            1)
-                LB_STRATEGY="round-robin"
-                break
-                ;;
-            2)
-                LB_STRATEGY="weight-based"
-                break
-                ;;
-            *)
-                log "Invalid choice. Select 1 or 2." "ERROR"
-                ;;
-        esac
-    done
-    
     save_config
     echo
     log "Configuration completed successfully!" "SUCCESS"
@@ -347,6 +434,69 @@ validate_ip() {
     fi
     
     return 0
+}
+
+# =============================================
+# SMART HEALTH CHECK SYSTEM
+# =============================================
+
+perform_health_check() {
+    local ip="$1"
+    local check_type="${2:-basic}"
+    
+    local start_time
+    start_time=$(date +%s%N)
+    local result="unknown"
+    local response_time=0
+    
+    # Try multiple ports and methods
+    local ports=(80 443 22)
+    local methods=("http" "https" "tcp")
+    
+    for i in "${!ports[@]}"; do
+        local port="${ports[$i]}"
+        local method="${methods[$i]}"
+        
+        case $method in
+            "http")
+                if timeout "$HEALTH_CHECK_TIMEOUT" curl -s -f "http://$ip:$port" &>/dev/null; then
+                    result="healthy"
+                    break
+                fi
+                ;;
+            "https")
+                if timeout "$HEALTH_CHECK_TIMEOUT" curl -s -f -k "https://$ip:$port" &>/dev/null; then
+                    result="healthy"
+                    break
+                fi
+                ;;
+            "tcp")
+                if timeout "$HEALTH_CHECK_TIMEOUT" bash -c "echo > /dev/tcp/$ip/$port" &>/dev/null; then
+                    result="healthy"
+                    break
+                fi
+                ;;
+        esac
+    done
+    
+    # Calculate response time
+    local end_time
+    end_time=$(date +%s%N)
+    response_time=$(( (end_time - start_time) / 1000000 ))  # Convert to milliseconds
+    
+    # Performance monitoring
+    if [ "$ENABLE_PERFORMANCE_MONITOR" = "true" ]; then
+        if [ "$result" = "healthy" ]; then
+            if [ "$response_time" -gt "$MAX_RESPONSE_TIME_MS" ]; then
+                result="degraded"
+                log "Performance degraded for $ip: ${response_time}ms" "PERF"
+            elif [ "$response_time" -lt "$MIN_RESPONSE_TIME_MS" ]; then
+                log "Excellent performance for $ip: ${response_time}ms" "PERF"
+            fi
+        fi
+    fi
+    
+    echo "$result:$response_time"
 }
 
 # =============================================
@@ -403,12 +553,11 @@ delete_dns_record() {
     fi
 }
 
-get_record_id_by_name() {
-    local name="$1"
-    local type="$2"
+get_cname_record_id() {
+    local cname="$1"
     
     local response
-    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=${name}&type=${type}")
+    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         echo "$response" | jq -r '.result[0].id // empty'
@@ -417,47 +566,82 @@ get_record_id_by_name() {
     fi
 }
 
+update_cname_target() {
+    local cname="$1"
+    local target_host="$2"
+    
+    # Get existing CNAME record ID
+    local record_id
+    record_id=$(get_cname_record_id "$cname")
+    
+    if [ -z "$record_id" ]; then
+        log "CNAME record not found: $cname" "ERROR"
+        return 1
+    fi
+    
+    local data
+    data=$(cat << EOF
+{
+  "type": "CNAME",
+  "name": "$cname",
+  "content": "$target_host",
+  "ttl": $DNS_TTL,
+  "proxied": false
+}
+EOF
+)
+    
+    local response
+    response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
+    
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        log "Updated CNAME: $cname → $target_host" "SUCCESS"
+        return 0
+    else
+        log "Failed to update CNAME" "ERROR"
+        return 1
+    fi
+}
+
 # =============================================
-# DUAL-IP DNS SETUP
+# SMART LOAD BALANCER SETUP
 # =============================================
 
-setup_dual_ip_dns() {
+setup_smart_load_balancer() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          DUAL IP DNS SETUP"
+    echo "          SMART LOAD BALANCER SETUP"
     echo "════════════════════════════════════════════════"
     echo
-    echo "This setup creates DNS records that distribute"
-    echo "traffic between two IP addresses."
-    echo
-    echo "Features:"
-    echo "  • Traffic distribution between 2 IPs"
-    echo "  • No automatic failover (no downtime)"
-    echo "  • Manual IP management"
-    echo "  • Health checking (optional)"
+    echo "This creates an intelligent load balancer with:"
+    echo "  • Primary IP priority (always used if healthy)"
+    echo "  • Automatic failover to Backup IP"
+    echo "  • Automatic recovery to Primary IP"
+    echo "  • Performance monitoring"
+    echo "  • No downtime during failover"
     echo
     
-    # Get two IP addresses
-    local ip1 ip2
+    # Get IP addresses
+    local primary_ip backup_ip
     
-    echo "Enter the two IP addresses for DNS distribution:"
-    echo "------------------------------------------------"
+    echo "Enter IP addresses:"
+    echo "-------------------"
     
-    # First IP
+    # Primary IP
     while true; do
-        read -rp "First IP Address: " ip1
-        if validate_ip "$ip1"; then
+        read -rp "Primary IP (main server - ALWAYS used if healthy): " primary_ip
+        if validate_ip "$primary_ip"; then
             break
         fi
         log "Invalid IPv4 address format" "ERROR"
     done
     
-    # Second IP
+    # Backup IP
     while true; do
-        read -rp "Second IP Address: " ip2
-        if validate_ip "$ip2"; then
-            if [ "$ip1" = "$ip2" ]; then
-                log "Warning: Both IPs are the same!" "WARNING"
+        read -rp "Backup IP (failover server): " backup_ip
+        if validate_ip "$backup_ip"; then
+            if [ "$primary_ip" = "$backup_ip" ]; then
+                log "Warning: Primary and Backup IPs are the same!" "WARNING"
                 read -rp "Continue anyway? (y/n): " choice
                 if [[ "$choice" =~ ^[Yy]$ ]]; then
                     break
@@ -470,253 +654,407 @@ setup_dual_ip_dns() {
         fi
     done
     
-    # Get CNAME prefix
-    echo
-    echo "Enter DNS record name:"
-    echo "----------------------"
-    echo "This will be your CNAME (e.g., app.example.com)"
-    echo
-    
-    local cname_prefix
-    read -rp "Subdomain prefix (leave empty for random): " cname_prefix
-    
-    if [ -z "$cname_prefix" ]; then
-        local random_id
-        random_id=$(date +%s%N | md5sum | cut -c1-8)
-        cname_prefix="app-${random_id}"
-    fi
-    
-    local cname="${cname_prefix}.${BASE_HOST}"
+    # Generate unique names
+    local random_id
+    random_id=$(date +%s%N | md5sum | cut -c1-8)
+    local cname="lb-${random_id}.${BASE_HOST}"
+    local primary_host="primary-${random_id}.${BASE_HOST}"
+    local backup_host="backup-${random_id}.${BASE_HOST}"
     
     echo
-    log "Creating Dual-IP DNS configuration..." "INFO"
+    log "Creating Smart Load Balancer..." "INFO"
     echo
     
-    # Create A records with different hostnames
-    local host1="${cname_prefix}-a1.${BASE_HOST}"
-    local host2="${cname_prefix}-a2.${BASE_HOST}"
-    
-    # Create first A record
-    log "Creating first A record: $host1 → $ip1" "INFO"
-    local record_id1
-    record_id1=$(create_dns_record "$host1" "A" "$ip1")
-    if [ -z "$record_id1" ]; then
-        log "Failed to create first A record" "ERROR"
+    # Create Primary A record
+    log "Creating Primary A record: $primary_host → $primary_ip" "INFO"
+    local primary_record_id
+    primary_record_id=$(create_dns_record "$primary_host" "A" "$primary_ip")
+    if [ -z "$primary_record_id" ]; then
+        log "Failed to create primary A record" "ERROR"
         return 1
     fi
     
-    # Create second A record
-    log "Creating second A record: $host2 → $ip2" "INFO"
-    local record_id2
-    record_id2=$(create_dns_record "$host2" "A" "$ip2")
-    if [ -z "$record_id2" ]; then
-        log "Failed to create second A record" "ERROR"
-        delete_dns_record "$record_id1"
+    # Create Backup A record
+    log "Creating Backup A record: $backup_host → $backup_ip" "INFO"
+    local backup_record_id
+    backup_record_id=$(create_dns_record "$backup_host" "A" "$backup_ip")
+    if [ -z "$backup_record_id" ]; then
+        log "Failed to create backup A record" "ERROR"
+        delete_dns_record "$primary_record_id"
         return 1
     fi
     
-    # Create CNAME record
-    log "Creating CNAME: $cname" "INFO"
-    
-    # Based on strategy, create appropriate DNS configuration
-    if [ "$LB_STRATEGY" = "round-robin" ]; then
-        # For round-robin, create both A records with same name
-        log "Strategy: Round Robin (both IPs equally)" "INFO"
-        
-        # Create additional A record for second IP (same name)
-        local record_id3
-        record_id3=$(create_dns_record "$cname" "A" "$ip2")
-        
-        # Update first A record to use CNAME name
-        delete_dns_record "$record_id1"
-        record_id1=$(create_dns_record "$cname" "A" "$ip1")
-        
-        echo
-        echo "════════════════════════════════════════════════"
-        log "DUAL-IP DNS CREATED SUCCESSFULLY!" "SUCCESS"
-        echo "════════════════════════════════════════════════"
-        echo
-        echo "Your DNS configuration:"
-        echo -e "  ${GREEN}$cname${NC} (Round Robin)"
-        echo "  ↳ IP: $ip1"
-        echo "  ↳ IP: $ip2"
-        echo
-        echo "Traffic will be distributed equally between both IPs."
-        
-        # Update state with both record IDs
-        save_state "$cname" "$ip1" "$ip2" "$record_id1" "$record_id3"
-        
-    else # weight-based
-        log "Strategy: Weight Based (70% primary, 30% backup)" "INFO"
-        
-        # Create CNAME that points to primary
-        local cname_record_id
-        cname_record_id=$(create_dns_record "$cname" "CNAME" "$host1")
-        
-        if [ -z "$cname_record_id" ]; then
-            log "Failed to create CNAME record" "ERROR"
-            delete_dns_record "$record_id1"
-            delete_dns_record "$record_id2"
-            return 1
-        fi
-        
-        echo
-        echo "════════════════════════════════════════════════"
-        log "DUAL-IP DNS CREATED SUCCESSFULLY!" "SUCCESS"
-        echo "════════════════════════════════════════════════"
-        echo
-        echo "Your DNS configuration:"
-        echo -e "  ${GREEN}$cname${NC} (Weight Based)"
-        echo "  ↳ Primary: $host1 → $ip1 (70% traffic)"
-        echo "  ↳ Backup:  $host2 → $ip2 (30% traffic)"
-        echo
-        echo "Note: Manual switching required for failover."
-        
-        # Save state
-        save_state "$cname" "$ip1" "$ip2" "$record_id1" "$record_id2"
+    # Create CNAME record pointing to primary
+    log "Creating CNAME: $cname → $primary_host" "INFO"
+    local cname_record_id
+    cname_record_id=$(create_dns_record "$cname" "CNAME" "$primary_host")
+    if [ -z "$cname_record_id" ]; then
+        log "Failed to create CNAME record" "ERROR"
+        delete_dns_record "$primary_record_id"
+        delete_dns_record "$backup_record_id"
+        return 1
     fi
     
+    # Save state
+    save_state "$cname" "$primary_ip" "$backup_ip" "$primary_record_id" "$backup_record_id" "$cname_record_id"
+    
     echo
-    echo "DNS Settings:"
-    echo "  TTL: $DNS_TTL seconds"
-    echo "  Propagation: Usually within 2-5 minutes"
+    echo "════════════════════════════════════════════════"
+    log "SMART LOAD BALANCER CREATED SUCCESSFULLY!" "SUCCESS"
+    echo "════════════════════════════════════════════════"
     echo
-    echo "You can now use ${GREEN}$cname${NC} in your applications."
+    echo "Your Load Balancer CNAME:"
+    echo -e "  ${GREEN}$cname${NC}"
+    echo
+    echo "Configuration:"
+    echo "  Primary: $primary_host → $primary_ip"
+    echo "  Backup:  $backup_host → $backup_ip"
+    echo "  CNAME:   $cname → $primary_host"
+    echo
+    echo "Smart Failover Settings:"
+    echo "  Health Check: Every ${HEALTH_CHECK_INTERVAL} seconds"
+    echo "  Failover after: $((HEALTH_CHECK_INTERVAL * MAX_FAILURES)) seconds"
+    echo "  Recovery after: $((HEALTH_CHECK_INTERVAL * RECOVERY_THRESHOLD)) seconds"
+    echo "  DNS TTL: ${DNS_TTL} seconds (fast propagation)"
+    echo
+    echo "Traffic Flow:"
+    echo "  1. Always uses Primary IP if healthy"
+    echo "  2. Auto-switch to Backup if Primary fails"
+    echo "  3. Auto-switch back to Primary when recovered"
+    echo "  4. No manual intervention needed"
+    echo
+    echo "To start the load balancer monitor:"
+    echo "  Run this script → Start Load Balancer Service"
     echo
 }
 
 # =============================================
-# HEALTH CHECKING (OPTIONAL, MANUAL)
+# INTELLIGENT FAILOVER SYSTEM
 # =============================================
 
-check_ip_health() {
-    local ip="$1"
+perform_failover() {
+    acquire_lock || return 1
     
-    log "Checking health of IP: $ip" "DEBUG"
+    local state
+    state=$(load_state)
     
-    # Try multiple methods for reliability
-    local healthy=false
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    local backup_host
+    backup_host="backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+    local primary_ip
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    local backup_ip
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    local active_ip
+    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
     
-    # Method 1: ping
-    if command -v ping &>/dev/null; then
-        if timeout 2 ping -c 1 -W 1 "$ip" &>/dev/null; then
-            healthy=true
-            log "Ping successful for $ip" "DEBUG"
-        fi
+    if [ -z "$cname" ]; then
+        log "No load balancer setup found for failover" "ERROR"
+        release_lock
+        return 1
     fi
     
-    # Method 2: curl on port 80
-    if [ "$healthy" = false ] && command -v curl &>/dev/null; then
-        if timeout 2 curl -s -f "http://$ip" &>/dev/null; then
-            healthy=true
-            log "HTTP check successful for $ip" "DEBUG"
-        fi
+    if [ "$active_ip" = "$backup_ip" ]; then
+        log "Already using Backup IP ($backup_ip)" "INFO"
+        release_lock
+        return 0
     fi
     
-    # Method 3: nc on port 80
-    if [ "$healthy" = false ] && command -v nc &>/dev/null; then
-        if timeout 2 nc -z -w 1 "$ip" 80 &>/dev/null; then
-            healthy=true
-            log "Port 80 check successful for $ip" "DEBUG"
-        fi
-    fi
+    log "Primary IP ($primary_ip) is unhealthy! Initiating failover..." "WARNING"
+    log "Switching CNAME to backup: $cname → $backup_host" "INFO"
     
-    if [ "$healthy" = true ]; then
-        echo "healthy"
+    if update_cname_target "$cname" "$backup_host"; then
+        update_state "active_ip" "$backup_ip"
+        update_state "failure_count" "0"
+        update_state "recovery_count" "0"
+        increment_counter "total_failovers"
+        update_state "last_failover" "$(date '+%Y-%m-%d %H:%M:%S')"
+        log "Failover completed! Now using Backup IP ($backup_ip)" "SUCCESS"
+        release_lock
+        return 0
     else
-        echo "unhealthy"
+        log "Failed to perform failover" "ERROR"
+        release_lock
+        return 1
     fi
 }
 
-check_health_status() {
+perform_recovery() {
+    acquire_lock || return 1
+    
+    local state
+    state=$(load_state)
+    
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    local primary_host
+    primary_host="primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+    local primary_ip
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    local backup_ip
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    local active_ip
+    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+    
+    if [ -z "$cname" ]; then
+        log "No load balancer setup found for recovery" "ERROR"
+        release_lock
+        return 1
+    fi
+    
+    if [ "$active_ip" = "$primary_ip" ]; then
+        log "Already using Primary IP ($primary_ip)" "INFO"
+        release_lock
+        return 0
+    fi
+    
+    log "Primary IP ($primary_ip) is healthy again! Switching back..." "INFO"
+    log "Switching CNAME to primary: $cname → $primary_host" "INFO"
+    
+    if update_cname_target "$cname" "$primary_host"; then
+        update_state "active_ip" "$primary_ip"
+        update_state "failure_count" "0"
+        update_state "recovery_count" "0"
+        log "Recovery completed! Now using Primary IP ($primary_ip)" "SUCCESS"
+        release_lock
+        return 0
+    else
+        log "Failed to perform recovery" "ERROR"
+        release_lock
+        return 1
+    fi
+}
+
+# =============================================
+# LOAD BALANCER MONITOR SERVICE
+# =============================================
+
+monitor_service() {
+    if ! acquire_lock; then
+        log "Another monitor instance is already running" "ERROR"
+        return 1
+    fi
+    
+    log "Starting Smart Load Balancer Monitor..." "INFO"
+    log "Health Check Interval: ${HEALTH_CHECK_INTERVAL} seconds" "INFO"
+    
+    # Load initial state
+    local state
+    state=$(load_state)
+    
+    local cname
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    
+    if [ -z "$cname" ]; then
+        log "No load balancer setup found. Please run setup first." "ERROR"
+        release_lock
+        return 1
+    fi
+    
+    log "Monitoring load balancer: $cname" "SUCCESS"
+    log "Press Ctrl+C to stop monitoring" "INFO"
+    
+    # Trap signals
+    trap 'cleanup_monitor' INT TERM EXIT
+    
+    # Main monitoring loop
+    local monitoring=true
+    while $monitoring; do
+        # Check if config still exists
+        if [ ! -f "$STATE_FILE" ]; then
+            log "Load balancer configuration removed. Stopping monitor." "INFO"
+            monitoring=false
+            break
+        fi
+        
+        state=$(load_state)
+        
+        local primary_ip
+        primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+        local backup_ip
+        backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+        local active_ip
+        active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+        local failure_count
+        failure_count=$(echo "$state" | jq -r '.failure_count // 0')
+        local recovery_count
+        recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
+        
+        # Update last check time
+        update_state "last_health_check" "$(date '+%Y-%m-%d %H:%M:%S')"
+        
+        # Check primary IP health
+        log "Checking Primary IP ($primary_ip) health..." "HEALTH"
+        local health_result
+        health_result=$(perform_health_check "$primary_ip")
+        local primary_health="${health_result%:*}"
+        local response_time="${health_result#*:}"
+        
+        # Update health status
+        update_state "health_status.primary" "$primary_health"
+        
+        # Check backup IP health (less frequently)
+        local backup_check_interval=$((HEALTH_CHECK_INTERVAL * 3))
+        local current_time
+        current_time=$(date +%s)
+        local last_backup_check
+        last_backup_check=$(echo "$state" | jq -r '.last_backup_check // 0')
+        
+        if [ $((current_time - last_backup_check)) -ge $backup_check_interval ]; then
+            log "Checking Backup IP ($backup_ip) health..." "HEALTH"
+            local backup_health_result
+            backup_health_result=$(perform_health_check "$backup_ip")
+            local backup_health="${backup_health_result%:*}"
+            update_state "health_status.backup" "$backup_health"
+            update_state "last_backup_check" "$current_time"
+        fi
+        
+        # Handle primary IP health status
+        if [ "$primary_health" = "healthy" ] || [ "$primary_health" = "degraded" ]; then
+            # Primary is healthy or degraded but still functional
+            update_state "failure_count" "0"
+            
+            # If currently on backup and primary is healthy, start recovery count
+            if [ "$active_ip" = "$backup_ip" ]; then
+                local new_recovery_count=$((recovery_count + 1))
+                update_state "recovery_count" "$new_recovery_count"
+                
+                if [ "$primary_health" = "healthy" ]; then
+                    log "Primary IP ($primary_ip) is healthy. Recovery count: $new_recovery_count/$RECOVERY_THRESHOLD" "HEALTH"
+                else
+                    log "Primary IP ($primary_ip) is degraded (${response_time}ms). Recovery count: $new_recovery_count/$RECOVERY_THRESHOLD" "HEALTH"
+                fi
+                
+                # Check if we should switch back to primary
+                if [ "$new_recovery_count" -ge "$RECOVERY_THRESHOLD" ]; then
+                    perform_recovery
+                fi
+            else
+                # Reset recovery count if already on primary
+                update_state "recovery_count" "0"
+                if [ "$primary_health" = "degraded" ]; then
+                    log "Primary IP ($primary_ip) performance degraded: ${response_time}ms" "WARNING"
+                fi
+            fi
+        else
+            # Primary is unhealthy
+            local new_failure_count=$((failure_count + 1))
+            update_state "failure_count" "$new_failure_count"
+            
+            log "Primary IP ($primary_ip) is unhealthy. Failure count: $new_failure_count/$MAX_FAILURES" "HEALTH"
+            
+            # Check backup health before failover
+            local backup_health
+            backup_health=$(echo "$state" | jq -r '.health_status.backup // "unknown"')
+            
+            # Check if we should switch to backup
+            if [ "$new_failure_count" -ge "$MAX_FAILURES" ] && [ "$active_ip" = "$primary_ip" ]; then
+                if [ "$backup_health" = "healthy" ] || [ "$backup_health" = "degraded" ]; then
+                    perform_failover
+                else
+                    log "Backup IP ($backup_ip) is also unhealthy. Cannot failover!" "ERROR"
+                    update_state "failure_count" "0"  # Reset to keep checking
+                fi
+            fi
+            
+            # Reset recovery count when primary is down
+            update_state "recovery_count" "0"
+        fi
+        
+        # Sleep before next check
+        sleep "$HEALTH_CHECK_INTERVAL"
+    done
+    
+    cleanup_monitor
+}
+
+cleanup_monitor() {
+    log "Stopping Load Balancer Monitor..." "INFO"
+    release_lock
+    exit 0
+}
+
+start_monitor() {
+    # Check if monitor is already running
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            log "Load balancer monitor is already running (PID: $lock_pid)" "INFO"
+            return 0
+        else
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    # Start monitor in background
+    monitor_service &
+    local monitor_pid=$!
+    
+    log "Load balancer monitor started in background (PID: $monitor_pid)" "SUCCESS"
+    log "Health logs: $HEALTH_LOG" "INFO"
+    log "Activity logs: $LOG_FILE" "INFO"
+}
+
+stop_monitor() {
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE")
+        
+        if [ -n "$lock_pid" ]; then
+            if kill "$lock_pid" 2>/dev/null; then
+                log "Stopped load balancer monitor (PID: $lock_pid)" "SUCCESS"
+            else
+                log "Monitor was not running" "INFO"
+            fi
+        fi
+        
+        rm -f "$LOCK_FILE"
+    else
+        log "Load balancer monitor is not running" "INFO"
+    fi
+}
+
+# =============================================
+# MANUAL CONTROL
+# =============================================
+
+manual_control() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "           MANUAL HEALTH CHECK"
+    echo "          MANUAL LOAD BALANCER CONTROL"
     echo "════════════════════════════════════════════════"
-    echo
-    echo "This checks the health of both IPs without"
-    echo "making any DNS changes."
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No dual-IP setup found" "ERROR"
+        log "No load balancer setup found" "ERROR"
         return 1
     fi
     
-    local ip1 ip2 cname
-    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
-    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
-    cname=$(jq -r '.cname // empty' "$STATE_FILE")
+    local state
+    state=$(load_state)
     
-    if [ -z "$ip1" ] || [ -z "$ip2" ]; then
-        log "IP addresses not found in state" "ERROR"
-        return 1
-    fi
+    local cname primary_ip backup_ip active_ip primary_health backup_health
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+    primary_health=$(echo "$state" | jq -r '.health_status.primary // "unknown"')
+    backup_health=$(echo "$state" | jq -r '.health_status.backup // "unknown"')
     
-    echo "Checking IP health status..."
-    echo
-    
-    echo -n "Primary IP ($ip1): "
-    local health1
-    health1=$(check_ip_health "$ip1")
-    if [ "$health1" = "healthy" ]; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
-    else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
-    fi
-    
-    echo -n "Backup IP ($ip2): "
-    local health2
-    health2=$(check_ip_health "$ip2")
-    if [ "$health2" = "healthy" ]; then
-        echo -e "${GREEN}✓ HEALTHY${NC}"
-    else
-        echo -e "${RED}✗ UNHEALTHY${NC}"
-    fi
-    
-    echo
-    echo "CNAME: $cname"
-    echo
-    echo "Note: This is a manual check only."
-    echo "No DNS records were modified."
-}
-
-# =============================================
-# MANUAL IP MANAGEMENT
-# =============================================
-
-manual_ip_management() {
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "          MANUAL IP MANAGEMENT"
-    echo "════════════════════════════════════════════════"
-    echo
-    
-    if [ ! -f "$STATE_FILE" ]; then
-        log "No dual-IP setup found" "ERROR"
-        return 1
-    fi
-    
-    local cname ip1 ip2 record_id1 record_id2 strategy
-    cname=$(jq -r '.cname // empty' "$STATE_FILE")
-    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
-    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
-    record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
-    record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
-    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
-    
-    echo "Current Configuration:"
+    echo "Current Status:"
     echo "  CNAME: $cname"
-    echo "  IP1: $ip1"
-    echo "  IP2: $ip2"
-    echo "  Strategy: $strategy"
+    echo "  Active IP: $active_ip"
+    echo "  Primary IP ($primary_ip): $primary_health"
+    echo "  Backup IP ($backup_ip): $backup_health"
     echo
     
-    echo "Options:"
-    echo "1. Switch to use only IP1"
-    echo "2. Switch to use only IP2"
-    echo "3. Use both IPs (round-robin)"
-    echo "4. Update IP addresses"
+    echo "Manual Control Options:"
+    echo "1. Force switch to Primary IP"
+    echo "2. Force switch to Backup IP"
+    echo "3. Run immediate health check"
+    echo "4. View detailed status"
     echo "5. Back to main menu"
     echo
     
@@ -724,58 +1062,65 @@ manual_ip_management() {
     
     case $choice in
         1)
-            log "Switching to use only IP1 ($ip1)..." "INFO"
-            if [ "$strategy" = "round-robin" ]; then
-                # Delete second A record
-                delete_dns_record "$record_id2"
-                log "Now using only IP1 ($ip1)" "SUCCESS"
-            else
-                # Update CNAME to point to host1
-                update_cname_target "$cname" "${cname%-*}-a1.${BASE_HOST}"
-                log "Switched to IP1 ($ip1)" "SUCCESS"
+            log "Forcing switch to Primary IP ($primary_ip)..." "INFO"
+            local primary_host
+            primary_host="primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+            if update_cname_target "$cname" "$primary_host"; then
+                update_state "active_ip" "$primary_ip"
+                update_state "failure_count" "0"
+                update_state "recovery_count" "0"
+                log "Switched to Primary IP ($primary_ip)" "SUCCESS"
             fi
             ;;
         2)
-            log "Switching to use only IP2 ($ip2)..." "INFO"
-            if [ "$strategy" = "round-robin" ]; then
-                # Delete first A record, keep second
-                delete_dns_record "$record_id1"
-                log "Now using only IP2 ($ip2)" "SUCCESS"
-            else
-                # Update CNAME to point to host2
-                update_cname_target "$cname" "${cname%-*}-a2.${BASE_HOST}"
-                log "Switched to IP2 ($ip2)" "SUCCESS"
+            log "Forcing switch to Backup IP ($backup_ip)..." "INFO"
+            local backup_host
+            backup_host="backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+            if update_cname_target "$cname" "$backup_host"; then
+                update_state "active_ip" "$backup_ip"
+                update_state "failure_count" "0"
+                update_state "recovery_count" "0"
+                log "Switched to Backup IP ($backup_ip)" "SUCCESS"
             fi
             ;;
         3)
-            log "Enabling both IPs (round-robin)..." "INFO"
-            if [ "$strategy" = "weight-based" ]; then
-                # Create A records for both IPs
-                delete_dns_record "$record_id1"
-                delete_dns_record "$record_id2"
-                
-                record_id1=$(create_dns_record "$cname" "A" "$ip1")
-                record_id2=$(create_dns_record "$cname" "A" "$ip2")
-                
-                if [ -n "$record_id1" ] && [ -n "$record_id2" ]; then
-                    # Update state
-                    local temp_file
-                    temp_file=$(mktemp)
-                    jq --arg strategy "round-robin" \
-                       --arg record_id1 "$record_id1" \
-                       --arg record_id2 "$record_id2" \
-                       '.strategy = $strategy | .record_id1 = $record_id1 | .record_id2 = $record_id2' \
-                       "$STATE_FILE" > "$temp_file"
-                    mv "$temp_file" "$STATE_FILE"
-                    
-                    log "Enabled round-robin with both IPs" "SUCCESS"
-                fi
+            echo
+            echo "Running immediate health checks..."
+            echo "---------------------------------"
+            
+            echo -n "Primary IP ($primary_ip): "
+            local health_result
+            health_result=$(perform_health_check "$primary_ip")
+            local health="${health_result%:*}"
+            local response_time="${health_result#*:}"
+            
+            if [ "$health" = "healthy" ]; then
+                echo -e "${GREEN}✓ HEALTHY${NC} (${response_time}ms)"
+            elif [ "$health" = "degraded" ]; then
+                echo -e "${YELLOW}⚠ DEGRADED${NC} (${response_time}ms)"
             else
-                log "Already using round-robin" "INFO"
+                echo -e "${RED}✗ UNHEALTHY${NC}"
             fi
+            
+            echo -n "Backup IP ($backup_ip): "
+            health_result=$(perform_health_check "$backup_ip")
+            health="${health_result%:*}"
+            response_time="${health_result#*:}"
+            
+            if [ "$health" = "healthy" ]; then
+                echo -e "${GREEN}✓ HEALTHY${NC} (${response_time}ms)"
+            elif [ "$health" = "degraded" ]; then
+                echo -e "${YELLOW}⚠ DEGRADED${NC} (${response_time}ms)"
+            else
+                echo -e "${RED}✗ UNHEALTHY${NC}"
+            fi
+            
+            # Update state
+            update_state "health_status.primary" "$(echo "$health_result" | cut -d: -f1)"
+            update_state "health_status.backup" "$(echo "$health_result" | cut -d: -f1)"
             ;;
         4)
-            update_ip_addresses
+            show_detailed_status
             ;;
         5)
             return
@@ -786,203 +1131,95 @@ manual_ip_management() {
     esac
 }
 
-update_ip_addresses() {
-    echo
-    echo "Update IP Addresses:"
-    echo "--------------------"
-    
-    local new_ip1 new_ip2
-    
-    while true; do
-        read -rp "New first IP: " new_ip1
-        if validate_ip "$new_ip1"; then
-            break
-        fi
-        log "Invalid IPv4 address" "ERROR"
-    done
-    
-    while true; do
-        read -rp "New second IP: " new_ip2
-        if validate_ip "$new_ip2"; then
-            break
-        fi
-        log "Invalid IPv4 address" "ERROR"
-    done
-    
-    log "Updating IP addresses..." "INFO"
-    
-    # Get current strategy
-    local strategy
-    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
-    
-    if [ "$strategy" = "round-robin" ]; then
-        # Update both A records
-        local record_id1 record_id2
-        record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
-        record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
-        
-        # Delete old records
-        delete_dns_record "$record_id1"
-        delete_dns_record "$record_id2"
-        
-        # Create new records
-        local cname
-        cname=$(jq -r '.cname // empty' "$STATE_FILE")
-        
-        record_id1=$(create_dns_record "$cname" "A" "$new_ip1")
-        record_id2=$(create_dns_record "$cname" "A" "$new_ip2")
-        
-        if [ -n "$record_id1" ] && [ -n "$record_id2" ]; then
-            # Update state
-            local temp_file
-            temp_file=$(mktemp)
-            jq --arg ip1 "$new_ip1" \
-               --arg ip2 "$new_ip2" \
-               --arg record_id1 "$record_id1" \
-               --arg record_id2 "$record_id2" \
-               '.ip1 = $ip1 | .ip2 = $ip2 | .record_id1 = $record_id1 | .record_id2 = $record_id2' \
-               "$STATE_FILE" > "$temp_file"
-            mv "$temp_file" "$STATE_FILE"
-            
-            log "IP addresses updated successfully" "SUCCESS"
-        fi
-    else
-        # For weight-based, update the A records
-        local cname_prefix host1 host2
-        cname_prefix=$(jq -r '.cname // empty' "$STATE_FILE" | cut -d'.' -f1)
-        host1="${cname_prefix}-a1.${BASE_HOST}"
-        host2="${cname_prefix}-a2.${BASE_HOST}"
-        
-        # Get current record IDs
-        local record_id1 record_id2
-        record_id1=$(get_record_id_by_name "$host1" "A")
-        record_id2=$(get_record_id_by_name "$host2" "A")
-        
-        if [ -n "$record_id1" ]; then
-            # Delete and recreate with new IP
-            delete_dns_record "$record_id1"
-            create_dns_record "$host1" "A" "$new_ip1"
-        fi
-        
-        if [ -n "$record_id2" ]; then
-            delete_dns_record "$record_id2"
-            create_dns_record "$host2" "A" "$new_ip2"
-        fi
-        
-        # Update state
-        local temp_file
-        temp_file=$(mktemp)
-        jq --arg ip1 "$new_ip1" \
-           --arg ip2 "$new_ip2" \
-           '.ip1 = $ip1 | .ip2 = $ip2' \
-           "$STATE_FILE" > "$temp_file"
-        mv "$temp_file" "$STATE_FILE"
-        
-        log "IP addresses updated successfully" "SUCCESS"
-    fi
-}
-
-update_cname_target() {
-    local cname="$1"
-    local target="$2"
-    
-    # Get CNAME record ID
-    local record_id
-    record_id=$(get_record_id_by_name "$cname" "CNAME")
-    
-    if [ -z "$record_id" ]; then
-        log "CNAME record not found: $cname" "ERROR"
-        return 1
-    fi
-    
-    local data
-    data=$(cat << EOF
-{
-  "type": "CNAME",
-  "name": "$cname",
-  "content": "$target",
-  "ttl": $DNS_TTL,
-  "proxied": false
-}
-EOF
-)
-    
-    local response
-    response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
-    
-    if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        log "Updated CNAME: $cname → $target" "SUCCESS"
-        return 0
-    else
-        log "Failed to update CNAME" "ERROR"
-        echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "$response"
-        return 1
-    fi
-}
-
 # =============================================
-# STATUS AND INFO FUNCTIONS
+# STATUS FUNCTIONS
 # =============================================
 
-show_status() {
+show_detailed_status() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "           CURRENT STATUS"
+    echo "          LOAD BALANCER DETAILED STATUS"
     echo "════════════════════════════════════════════════"
     echo
     
-    if [ -f "$STATE_FILE" ]; then
-        local cname ip1 ip2 strategy created_at
-        cname=$(jq -r '.cname // empty' "$STATE_FILE")
-        ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
-        ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
-        strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
-        created_at=$(jq -r '.created_at // empty' "$STATE_FILE")
-        
-        if [ -n "$cname" ]; then
-            echo -e "${GREEN}Dual-IP DNS Configuration:${NC}"
-            echo "  CNAME: $cname"
-            echo "  IP1: $ip1"
-            echo "  IP2: $ip2"
-            echo "  Strategy: $strategy"
-            echo "  Created: $created_at"
-            echo
-            
-            # Show current DNS records
-            echo -e "${CYAN}Current DNS Records:${NC}"
-            
-            if [ "$strategy" = "round-robin" ]; then
-                echo "  $cname → $ip1 (A)"
-                echo "  $cname → $ip2 (A)"
-                echo "  Traffic: Distributed equally"
-            else
-                local cname_prefix host1 host2
-                cname_prefix=$(echo "$cname" | cut -d'.' -f1)
-                host1="${cname_prefix}-a1.${BASE_HOST}"
-                host2="${cname_prefix}-a2.${BASE_HOST}"
-                echo "  $cname → $host1 (CNAME)"
-                echo "  $host1 → $ip1 (A)"
-                echo "  $host2 → $ip2 (A)"
-                echo "  Traffic: 70% primary, 30% backup"
-            fi
-        fi
-    else
-        echo -e "${YELLOW}No dual-IP DNS configuration found${NC}"
-        echo
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No load balancer setup found" "ERROR"
+        return 1
     fi
     
-    # API status
+    local state
+    state=$(load_state)
+    
+    local cname primary_ip backup_ip active_ip created_at
+    local failure_count recovery_count total_failovers last_failover
+    local primary_health backup_health last_health_check
+    
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    active_ip=$(echo "$state" | jq -r '.active_ip // empty')
+    created_at=$(echo "$state" | jq -r '.created_at // empty')
+    failure_count=$(echo "$state" | jq -r '.failure_count // 0')
+    recovery_count=$(echo "$state" | jq -r '.recovery_count // 0')
+    total_failovers=$(echo "$state" | jq -r '.total_failovers // 0')
+    last_failover=$(echo "$state" | jq -r '.last_failover // "Never"')
+    primary_health=$(echo "$state" | jq -r '.health_status.primary // "unknown"')
+    backup_health=$(echo "$state" | jq -r '.health_status.backup // "unknown"')
+    last_health_check=$(echo "$state" | jq -r '.last_health_check // "Never"')
+    
+    echo -e "${GREEN}Load Balancer Configuration:${NC}"
+    echo "  CNAME: $cname"
+    echo "  Created: $created_at"
     echo
-    echo -e "${PURPLE}API Status:${NC}"
-    if load_config && test_api; then
-        echo -e "  Connection: ${GREEN}✓ OK${NC}"
-        if test_zone; then
-            echo -e "  Zone Access: ${GREEN}✓ OK${NC}"
+    
+    echo -e "${CYAN}IP Status:${NC}"
+    echo -n "  Primary ($primary_ip): "
+    if [ "$primary_health" = "healthy" ]; then
+        echo -e "${GREEN}✓ HEALTHY${NC}"
+    elif [ "$primary_health" = "degraded" ]; then
+        echo -e "${YELLOW}⚠ DEGRADED${NC}"
+    else
+        echo -e "${RED}✗ UNHEALTHY${NC}"
+    fi
+    
+    echo -n "  Backup ($backup_ip): "
+    if [ "$backup_health" = "healthy" ]; then
+        echo -e "${GREEN}✓ HEALTHY${NC}"
+    elif [ "$backup_health" = "degraded" ]; then
+        echo -e "${YELLOW}⚠ DEGRADED${NC}"
+    else
+        echo -e "${RED}✗ UNHEALTHY${NC}"
+    fi
+    
+    echo -n "  Active IP: "
+    if [ "$active_ip" = "$primary_ip" ]; then
+        echo -e "${GREEN}$active_ip (PRIMARY)${NC}"
+    else
+        echo -e "${YELLOW}$active_ip (BACKUP - FAILOVER)${NC}"
+    fi
+    echo
+    
+    echo -e "${PURPLE}Failover Status:${NC}"
+    echo "  Failure Count: $failure_count/$MAX_FAILURES"
+    echo "  Recovery Count: $recovery_count/$RECOVERY_THRESHOLD"
+    echo "  Total Failovers: $total_failovers"
+    echo "  Last Failover: $last_failover"
+    echo "  Last Health Check: $last_health_check"
+    echo
+    
+    # Check monitor status
+    echo -e "${ORANGE}Monitor Status:${NC}"
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            echo -e "  Status: ${GREEN}RUNNING${NC} (PID: $lock_pid)"
         else
-            echo -e "  Zone Access: ${RED}✗ FAILED${NC}"
+            echo -e "  Status: ${RED}STOPPED${NC}"
+            rm -f "$LOCK_FILE"
         fi
     else
-        echo -e "  Connection: ${RED}✗ NOT CONFIGURED${NC}"
+        echo -e "  Status: ${YELLOW}NOT RUNNING${NC}"
     fi
     
     echo
@@ -997,25 +1234,27 @@ show_cname() {
         if [ -n "$cname" ]; then
             echo
             echo "════════════════════════════════════════════════"
-            echo "           YOUR DUAL-IP DNS RECORD"
+            echo "           YOUR LOAD BALANCER CNAME"
             echo "════════════════════════════════════════════════"
             echo
             echo -e "  ${GREEN}$cname${NC}"
             echo
-            echo "This CNAME distributes traffic between two IPs."
+            echo "Smart Load Balancer Features:"
+            echo "  • Always uses Primary IP if healthy"
+            echo "  • Auto-failover to Backup if Primary fails"
+            echo "  • Auto-recovery when Primary is healthy again"
+            echo "  • Performance monitoring"
+            echo "  • Health checks every ${HEALTH_CHECK_INTERVAL}s"
+            echo "  • DNS TTL: ${DNS_TTL}s (fast propagation)"
             echo
-            echo "Usage:"
-            echo "  • Use $cname in your applications"
-            echo "  • DNS will distribute traffic automatically"
-            echo "  • No automatic failover (stable operation)"
-            echo
-            echo "DNS propagation: Usually 2-5 minutes"
+            echo "Use this CNAME in your applications."
+            echo "The load balancer will handle everything automatically."
             echo
         else
-            log "No dual-IP DNS record found" "ERROR"
+            log "No load balancer setup found" "ERROR"
         fi
     else
-        log "No dual-IP DNS record found" "ERROR"
+        log "No load balancer setup found" "ERROR"
     fi
 }
 
@@ -1025,32 +1264,34 @@ show_cname() {
 
 cleanup() {
     echo
-    log "WARNING: This will delete ALL dual-IP DNS records!" "WARNING"
+    log "WARNING: This will delete the load balancer configuration!" "WARNING"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No dual-IP setup found to cleanup" "ERROR"
+        log "No load balancer setup found to cleanup" "ERROR"
         return 1
     fi
     
-    local cname ip1 ip2 record_id1 record_id2 strategy
-    cname=$(jq -r '.cname // empty' "$STATE_FILE")
-    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
-    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
-    record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
-    record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
-    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
+    local state
+    state=$(load_state)
+    
+    local cname primary_ip backup_ip primary_record_id backup_record_id cname_record_id
+    cname=$(echo "$state" | jq -r '.cname // empty')
+    primary_ip=$(echo "$state" | jq -r '.primary_ip // empty')
+    backup_ip=$(echo "$state" | jq -r '.backup_ip // empty')
+    primary_record_id=$(echo "$state" | jq -r '.primary_record_id // empty')
+    backup_record_id=$(echo "$state" | jq -r '.backup_record_id // empty')
+    cname_record_id=$(echo "$state" | jq -r '.cname_record_id // empty')
     
     if [ -z "$cname" ]; then
-        log "No active dual-IP setup found" "ERROR"
+        log "No active load balancer found" "ERROR"
         return 1
     fi
     
-    echo "Records to delete:"
+    echo "Load Balancer to delete:"
     echo "  CNAME: $cname"
-    echo "  IP1: $ip1"
-    echo "  IP2: $ip2"
-    echo "  Strategy: $strategy"
+    echo "  Primary IP: $primary_ip"
+    echo "  Backup IP: $backup_ip"
     echo
     
     read -rp "Are you sure? Type 'DELETE' to confirm: " confirm
@@ -1059,28 +1300,20 @@ cleanup() {
         return 0
     fi
     
-    log "Deleting DNS records..." "INFO"
+    # Stop monitor first
+    stop_monitor
     
-    # Delete records based on strategy
-    if [ "$strategy" = "round-robin" ]; then
-        # Delete both A records
-        delete_dns_record "$record_id1"
-        delete_dns_record "$record_id2"
-    else
-        # Delete CNAME and A records
-        local cname_record_id
-        cname_record_id=$(get_record_id_by_name "$cname" "CNAME")
-        delete_dns_record "$cname_record_id"
-        
-        # Delete A records
-        delete_dns_record "$record_id1"
-        delete_dns_record "$record_id2"
-    fi
+    log "Deleting load balancer DNS records..." "INFO"
     
-    # Delete state file
-    rm -f "$STATE_FILE"
+    # Delete DNS records
+    delete_dns_record "$cname_record_id"
+    delete_dns_record "$primary_record_id"
+    delete_dns_record "$backup_record_id"
     
-    log "Cleanup completed!" "SUCCESS"
+    # Delete state files
+    rm -f "$STATE_FILE" "$LOCK_FILE"
+    
+    log "Load balancer cleanup completed!" "SUCCESS"
 }
 
 # =============================================
@@ -1091,32 +1324,54 @@ show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE DUAL-IP DNS MANAGER v3.0       ║"
+    echo "║    CLOUDFLARE SMART LOAD BALANCER v4.0       ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
-    echo -e "║  ${GREEN}1.${NC} Create Dual-IP DNS Record               ║"
-    echo -e "║  ${GREEN}2.${NC} Show Current Status                     ║"
-    echo -e "║  ${GREEN}3.${NC} Manual IP Management                    ║"
-    echo -e "║  ${GREEN}4.${NC} Check IP Health (Manual)                ║"
-    echo -e "║  ${GREEN}5.${NC} Show My CNAME                           ║"
-    echo -e "║  ${GREEN}6.${NC} Cleanup (Delete All)                    ║"
-    echo -e "║  ${GREEN}7.${NC} Configure API Settings                  ║"
-    echo -e "║  ${GREEN}8.${NC} Exit                                    ║"
+    echo -e "║  ${GREEN}1.${NC} Create Smart Load Balancer               ║"
+    echo -e "║  ${GREEN}2.${NC} Show Detailed Status                     ║"
+    echo -e "║  ${GREEN}3.${NC} Start Load Balancer Service              ║"
+    echo -e "║  ${GREEN}4.${NC} Stop Load Balancer Service               ║"
+    echo -e "║  ${GREEN}5.${NC} Manual Control                           ║"
+    echo -e "║  ${GREEN}6.${NC} Show My CNAME                            ║"
+    echo -e "║  ${GREEN}7.${NC} Cleanup (Delete All)                     ║"
+    echo -e "║  ${GREEN}8.${NC} Configure API Settings                   ║"
+    echo -e "║  ${GREEN}9.${NC} Exit                                     ║"
     echo "║                                                ║"
     echo "╠════════════════════════════════════════════════╣"
     
     # Show current status
     if [ -f "$STATE_FILE" ]; then
-        local cname ip1 ip2 strategy
+        local cname active_ip primary_health
         cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        ip1=$(jq -r '.ip1 // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        ip2=$(jq -r '.ip2 // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE" 2>/dev/null || echo "")
+        active_ip=$(jq -r '.active_ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        primary_health=$(jq -r '.health_status.primary // "unknown"' "$STATE_FILE" 2>/dev/null || echo "")
         
         if [ -n "$cname" ]; then
-            echo -e "║  ${CYAN}Active: $cname${NC}"
-            echo -e "║  ${CYAN}IPs: $ip1 / $ip2${NC}"
-            echo -e "║  ${CYAN}Strategy: $strategy${NC}"
+            local monitor_status=""
+            
+            if [ -f "$LOCK_FILE" ]; then
+                local lock_pid
+                lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+                if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+                    monitor_status="${GREEN}●${NC}"
+                else
+                    monitor_status="${RED}●${NC}"
+                fi
+            else
+                monitor_status="${YELLOW}○${NC}"
+            fi
+            
+            local health_status=""
+            if [ "$primary_health" = "healthy" ]; then
+                health_status="${GREEN}✓${NC}"
+            elif [ "$primary_health" = "degraded" ]; then
+                health_status="${YELLOW}⚠${NC}"
+            else
+                health_status="${RED}✗${NC}"
+            fi
+            
+            echo -e "║  ${CYAN}LB: $cname${NC}"
+            echo -e "║  ${CYAN}Active: $active_ip ${health_status} ${monitor_status}${NC}"
         fi
     fi
     
@@ -1146,56 +1401,60 @@ main() {
     while true; do
         show_menu
         
-        read -rp "Select option (1-8): " choice
+        read -rp "Select option (1-9): " choice
         
         case $choice in
             1)
                 if load_config; then
-                    setup_dual_ip_dns
+                    setup_smart_load_balancer
                 else
-                    log "Please configure API settings first (option 7)" "ERROR"
+                    log "Please configure API settings first (option 8)" "ERROR"
                 fi
                 pause
                 ;;
             2)
-                show_status
+                show_detailed_status
                 pause
                 ;;
             3)
                 if load_config; then
-                    manual_ip_management
+                    start_monitor
                 else
-                    log "Please configure API settings first (option 7)" "ERROR"
+                    log "Please configure API settings first (option 8)" "ERROR"
                 fi
                 pause
                 ;;
             4)
-                if load_config; then
-                    check_health_status
-                else
-                    log "Please configure API settings first (option 7)" "ERROR"
-                fi
+                stop_monitor
                 pause
                 ;;
             5)
-                show_cname
+                if load_config; then
+                    manual_control
+                else
+                    log "Please configure API settings first (option 8)" "ERROR"
+                fi
                 pause
                 ;;
             6)
-                cleanup
+                show_cname
                 pause
                 ;;
             7)
-                configure_api
+                cleanup
+                pause
                 ;;
             8)
+                configure_api
+                ;;
+            9)
                 echo
                 log "Goodbye!" "INFO"
                 echo
                 exit 0
                 ;;
             *)
-                log "Invalid option. Please select 1-8." "ERROR"
+                log "Invalid option. Please select 1-9." "ERROR"
                 sleep 1
                 ;;
         esac
