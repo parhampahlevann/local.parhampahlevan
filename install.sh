@@ -3,7 +3,7 @@
 # ============================================================================
 # Cloudflare CNAME with Dual IPv4 Setup Script
 # Automatically configures DNS records for load balancing between two servers
-# Version: 1.0
+# Version: 1.1
 # Author: [Your Name]
 # Repository: [Your GitHub Repo URL]
 # ============================================================================
@@ -85,9 +85,9 @@ validate_ip() {
 # Function to get current server's public IP
 get_public_ip() {
     local ip
-    ip=$(curl -s -4 https://ifconfig.me 2>/dev/null || curl -s -4 https://api.ipify.org 2>/dev/null || curl -s -4 https://ipinfo.io/ip 2>/dev/null)
+    ip=$(curl -s -4 --fail https://ifconfig.me 2>/dev/null || curl -s -4 --fail https://api.ipify.org 2>/dev/null || curl -s -4 --fail https://ipinfo.io/ip 2>/dev/null || echo "")
     
-    if validate_ip "$ip"; then
+    if [[ -n "$ip" ]] && validate_ip "$ip"; then
         echo "$ip"
         return 0
     else
@@ -102,9 +102,9 @@ detect_server_role() {
     print_status "Detecting server role..." "$BLUE"
     
     if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
+        source "$CONFIG_FILE" 2>/dev/null
         
-        if validate_ip "$SERVER1_IP"; then
+        if validate_ip "$SERVER1_IP" 2>/dev/null; then
             CURRENT_IP=$(get_public_ip)
             
             if [[ "$CURRENT_IP" == "$SERVER1_IP" ]]; then
@@ -176,7 +176,7 @@ collect_config() {
     # Get domain information
     while [[ -z "$DOMAIN" ]]; do
         read -p "Enter your main domain (e.g., example.com): " DOMAIN
-        if [[ -z "$DOMAIN" ]]; do
+        if [[ -z "$DOMAIN" ]]; then
             print_status "Domain cannot be empty!" "$RED"
         fi
     done
@@ -299,9 +299,9 @@ create_dns_records() {
             \"ttl\": 120,
             \"proxied\": false,
             \"comment\": \"$comment\"
-        }")
+        }" 2>/dev/null)
     
-    if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | jq -e '.success' > /dev/null 2>&1; then
         local record_id
         record_id=$(echo "$response" | jq -r '.result.id')
         print_status "✓ $record_type record created successfully (ID: $record_id)" "$GREEN"
@@ -309,7 +309,7 @@ create_dns_records() {
         return 0
     else
         local error_msg
-        error_msg=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
+        error_msg=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error or no response")
         print_status "✗ Failed to create $record_type record: $error_msg" "$RED"
         return 1
     fi
@@ -325,9 +325,9 @@ check_existing_record() {
     local response
     response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=$record_type&name=$record_name" \
         -H "X-Auth-Email: $CF_EMAIL" \
-        -H "X-Auth-Key: $CF_API_KEY")
+        -H "X-Auth-Key: $CF_API_KEY" 2>/dev/null)
     
-    if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | jq -e '.success' > /dev/null 2>&1; then
         local count
         count=$(echo "$response" | jq '.result | length')
         if [[ $count -gt 0 ]]; then
@@ -362,14 +362,14 @@ update_dns_record() {
             \"ttl\": 120,
             \"proxied\": false,
             \"comment\": \"$comment\"
-        }")
+        }" 2>/dev/null)
     
-    if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | jq -e '.success' > /dev/null 2>&1; then
         print_status "✓ Record updated successfully" "$GREEN"
         return 0
     else
         local error_msg
-        error_msg=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
+        error_msg=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error or no response")
         print_status "✗ Failed to update record: $error_msg" "$RED"
         return 1
     fi
@@ -464,7 +464,10 @@ setup_second_server() {
         return 1
     fi
     
-    source "$CONFIG_FILE"
+    source "$CONFIG_FILE" 2>/dev/null || {
+        print_status "Error reading configuration file!" "$RED"
+        return 1
+    }
     
     # Get current server's IP
     local current_ip
@@ -524,21 +527,21 @@ if [[ -f "$CONFIG_FILE" ]]; then
     echo "[$(date)] Checking DNS health..." >> "$LOG_FILE"
     
     # Check Server 1 A record
-    if dig +short "$A1_NAME" | grep -q "$SERVER1_IP"; then
+    if dig +short "$A1_NAME" 2>/dev/null | grep -q "$SERVER1_IP"; then
         echo "✓ Server 1 A record is correct" >> "$LOG_FILE"
     else
         echo "✗ Server 1 A record may be incorrect" >> "$LOG_FILE"
     fi
     
     # Check Server 2 A record
-    if dig +short "$A2_NAME" | grep -q "$SERVER2_IP"; then
+    if dig +short "$A2_NAME" 2>/dev/null | grep -q "$SERVER2_IP"; then
         echo "✓ Server 2 A record is correct" >> "$LOG_FILE"
     else
         echo "✗ Server 2 A record may be incorrect" >> "$LOG_FILE"
     fi
     
     # Check CNAME record
-    if dig +short "$CNAME_NAME" CNAME | grep -q "$A1_NAME"; then
+    if dig +short "$CNAME_NAME" CNAME 2>/dev/null | grep -q "$A1_NAME"; then
         echo "✓ CNAME record is correct" >> "$LOG_FILE"
     else
         echo "✗ CNAME record may be incorrect" >> "$LOG_FILE"
