@@ -1,19 +1,18 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE SMART LOAD BALANCER v4.1
+# CLOUDFLARE DNS SWITCH v1.0
 # =============================================
 
 set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.cf-smart-lb"
+CONFIG_DIR="$HOME/.cf-dns-switch"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
-HEALTH_LOG="$CONFIG_DIR/health.log"
-LOCK_FILE="/tmp/cf-lb.lock"
+LOCK_FILE="/tmp/cf-dns-switch.lock"
 
 # Cloudflare API
 CF_API_BASE="https://api.cloudflare.com/client/v4"
@@ -21,27 +20,11 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
-# Smart Load Balancer Settings
+# DNS Settings - NO AUTOMATION
 PRIMARY_IP=""
 BACKUP_IP=""
 CNAME=""
-DNS_TTL=60  # 1 minute TTL for fast propagation
-
-# Health Check Settings - DISABLED
-ENABLE_HEALTH_CHECKS=false  # Disabled as requested
-HEALTH_CHECK_INTERVAL=30
-HEALTH_CHECK_TIMEOUT=5
-MAX_FAILURES=3
-RECOVERY_THRESHOLD=5
-
-# Protocol Settings
-ENABLE_QUIC=false
-ENABLE_HTTPS=true
-PREFERRED_PORTS=(443 80 22)
-CUSTOM_PORTS=()
-
-# Performance Settings
-ENABLE_PERFORMANCE_MONITOR=false  # Disabled as requested
+DNS_TTL=300  # Standard 5-minute TTL (Cloudflare default)
 
 # Colors
 RED='\033[0;31m'
@@ -49,16 +32,14 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-PURPLE='\033[0;35m'
-ORANGE='\033[0;33m'
 NC='\033[0m'
 
 # =============================================
-# LOCK MANAGEMENT (Prevent Multiple Instances)
+# LOCK MANAGEMENT
 # =============================================
 
 acquire_lock() {
-    local max_retries=10
+    local max_retries=5
     local retry_count=0
     
     while [ $retry_count -lt $max_retries ]; do
@@ -113,9 +94,6 @@ log() {
             echo -e "${CYAN}[$timestamp] [INFO]${NC} $msg"
             echo "[$timestamp] [INFO] $msg" >> "$LOG_FILE"
             ;;
-        "HEALTH")
-            echo -e "${BLUE}[$timestamp] [HEALTH]${NC} $msg" >> "$HEALTH_LOG"
-            ;;
         *)
             echo "[$timestamp] [$level] $msg"
             echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
@@ -135,7 +113,6 @@ pause() {
 ensure_dir() {
     mkdir -p "$CONFIG_DIR"
     touch "$LOG_FILE" 2>/dev/null || true
-    touch "$HEALTH_LOG" 2>/dev/null || true
 }
 
 check_prerequisites() {
@@ -192,11 +169,6 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 DNS_TTL="$DNS_TTL"
-ENABLE_HEALTH_CHECKS="$ENABLE_HEALTH_CHECKS"
-ENABLE_QUIC="$ENABLE_QUIC"
-ENABLE_HTTPS="$ENABLE_HTTPS"
-PREFERRED_PORTS=(${PREFERRED_PORTS[@]})
-CUSTOM_PORTS=(${CUSTOM_PORTS[@]})
 EOF
     log "Configuration saved" "SUCCESS"
 }
@@ -219,13 +191,8 @@ save_state() {
   "cname_record_id": "$cname_record_id",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
   "active_ip": "$primary_ip",
-  "health_status": {
-    "primary": "unknown",
-    "backup": "unknown"
-  },
-  "total_failovers": 0,
-  "last_failover": null,
-  "health_checks_enabled": "$ENABLE_HEALTH_CHECKS"
+  "last_switch": null,
+  "mode": "manual_only"
 }
 EOF
 }
@@ -243,7 +210,7 @@ update_state() {
 }
 
 # =============================================
-# API FUNCTIONS
+# API FUNCTIONS WITH IMPROVED TIMEOUTS
 # =============================================
 
 api_request() {
@@ -254,21 +221,24 @@ api_request() {
     local url="${CF_API_BASE}${endpoint}"
     local response
     
+    # Use longer timeout for DNS operations
+    local timeout=30
+    
     if [ -n "$data" ]; then
         response=$(curl -s -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --max-time 10 \
+            --max-time $timeout \
             --retry 2 \
-            --retry-delay 1 \
+            --retry-delay 2 \
             --data "$data" 2>/dev/null || echo '{"success":false,"errors":[{"message":"API Connection failed"}]}')
     else
         response=$(curl -s -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --max-time 10 \
+            --max-time $timeout \
             --retry 2 \
-            --retry-delay 1 \
+            --retry-delay 2 \
             2>/dev/null || echo '{"success":false,"errors":[{"message":"API Connection failed"}]}')
     fi
     
@@ -410,7 +380,7 @@ validate_ip() {
 }
 
 # =============================================
-# DNS MANAGEMENT
+# DNS MANAGEMENT WITH CNAME FIX
 # =============================================
 
 create_dns_record() {
@@ -437,7 +407,7 @@ EOF
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         local record_id
         record_id=$(echo "$response" | jq -r '.result.id')
-        log "Created $type record: $name → $content (ID: $record_id)" "DEBUG"
+        log "Created $type record: $name → $content" "INFO"
         echo "$record_id"
         return 0
     else
@@ -463,8 +433,21 @@ delete_dns_record() {
         log "Deleted DNS record: $record_id" "INFO"
         return 0
     else
-        log "Failed to delete DNS record: $record_id" "ERROR"
+        log "Failed to delete DNS record: $record_id" "WARNING"
         return 1
+    fi
+}
+
+get_cname_record() {
+    local cname="$1"
+    
+    local response
+    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
+    
+    if echo "$response" | jq -e '.success == true' &>/dev/null; then
+        echo "$response"
+    else
+        echo ""
     fi
 }
 
@@ -472,21 +455,30 @@ update_cname_target() {
     local cname="$1"
     local target_host="$2"
     
-    # Get existing CNAME record ID
-    local response
-    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
+    log "Looking up CNAME record: $cname" "INFO"
     
-    if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        local record_id
-        record_id=$(echo "$response" | jq -r '.result[0].id // empty')
-        
-        if [ -z "$record_id" ]; then
-            log "CNAME record not found: $cname" "ERROR"
-            return 1
-        fi
-        
-        local data
-        data=$(cat << EOF
+    # Get existing CNAME record
+    local response
+    response=$(get_cname_record "$cname")
+    
+    if [ -z "$response" ]; then
+        log "Failed to fetch CNAME record" "ERROR"
+        return 1
+    fi
+    
+    local record_id
+    record_id=$(echo "$response" | jq -r '.result[0].id // empty')
+    
+    if [ -z "$record_id" ]; then
+        log "CNAME record not found: $cname" "ERROR"
+        return 1
+    fi
+    
+    log "Found CNAME record ID: $record_id" "INFO"
+    
+    # Update the CNAME record
+    local data
+    data=$(cat << EOF
 {
   "type": "CNAME",
   "name": "$cname",
@@ -496,42 +488,56 @@ update_cname_target() {
 }
 EOF
 )
+    
+    log "Updating CNAME: $cname → $target_host" "INFO"
+    local update_response
+    update_response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
+    
+    if echo "$update_response" | jq -e '.success == true' &>/dev/null; then
+        log "Successfully updated CNAME: $cname → $target_host" "SUCCESS"
         
-        local update_response
-        update_response=$(api_request "PUT" "/zones/${CF_ZONE_ID}/dns_records/$record_id" "$data")
+        # Verify the update was applied
+        sleep 2
+        local verify_response
+        verify_response=$(get_cname_record "$cname")
         
-        if echo "$update_response" | jq -e '.success == true' &>/dev/null; then
-            log "Updated CNAME: $cname → $target_host" "SUCCESS"
-            return 0
-        else
-            log "Failed to update CNAME" "ERROR"
-            local error_msg
-            error_msg=$(echo "$update_response" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$update_response")
-            log "API Error: $error_msg" "DEBUG"
-            return 1
+        if [ -n "$verify_response" ]; then
+            local current_target
+            current_target=$(echo "$verify_response" | jq -r '.result[0].content // ""')
+            if [ "$current_target" = "$target_host" ]; then
+                log "CNAME update verified successfully" "INFO"
+            else
+                log "Warning: CNAME target mismatch. Expected: $target_host, Got: $current_target" "WARNING"
+            fi
         fi
+        
+        return 0
     else
-        log "Failed to fetch CNAME record: $cname" "ERROR"
+        log "Failed to update CNAME" "ERROR"
+        local error_msg
+        error_msg=$(echo "$update_response" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$update_response")
+        log "API Error: $error_msg" "DEBUG"
         return 1
     fi
 }
 
 # =============================================
-# SIMPLE LOAD BALANCER SETUP (NO HEALTH CHECKS)
+# SIMPLE DNS SWITCH SETUP
 # =============================================
 
-setup_load_balancer() {
+setup_dns_switch() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          CLOUDFLARE LOAD BALANCER SETUP"
+    echo "          CLOUDFLARE DNS SWITCH SETUP"
     echo "════════════════════════════════════════════════"
     echo
-    echo "This creates a simple load balancer with:"
+    echo "This creates a simple DNS switch with:"
     echo "  • Primary IP (default active)"
-    echo "  • Backup IP (manual failover only)"
-    echo "  • Fast DNS propagation (60s TTL)"
-    echo "  • Manual control only"
+    echo "  • Backup IP (manual switch only)"
+    echo "  • Standard DNS TTL (300 seconds)"
     echo "  • NO automatic health checks"
+    echo "  • NO auto-failover"
+    echo "  • Manual control only"
     echo
     
     # Get IP addresses
@@ -551,13 +557,16 @@ setup_load_balancer() {
     
     # Backup IP
     while true; do
-        read -rp "Backup IP (for manual failover): " backup_ip
-        if validate_ip "$backup_ip"; then
+        read -rp "Backup IP (for manual switch): " backup_ip
+        if validate_ip "$backup_ip" ]; then
             if [ "$primary_ip" = "$backup_ip" ]; then
+                echo
                 log "Warning: Primary and Backup IPs are the same!" "WARNING"
                 read -rp "Continue anyway? (y/n): " choice
                 if [[ "$choice" =~ ^[Yy]$ ]]; then
                     break
+                else
+                    continue
                 fi
             else
                 break
@@ -570,12 +579,12 @@ setup_load_balancer() {
     # Generate unique names
     local random_id
     random_id=$(date +%s%N | md5sum | cut -c1-8)
-    local cname="lb-${random_id}.${BASE_HOST}"
+    local cname="switch-${random_id}.${BASE_HOST}"
     local primary_host="primary-${random_id}.${BASE_HOST}"
     local backup_host="backup-${random_id}.${BASE_HOST}"
     
     echo
-    log "Creating Load Balancer..." "INFO"
+    log "Creating DNS Switch..." "INFO"
     echo
     
     # Create Primary A record
@@ -613,10 +622,10 @@ setup_load_balancer() {
     
     echo
     echo "════════════════════════════════════════════════"
-    log "LOAD BALANCER CREATED SUCCESSFULLY!" "SUCCESS"
+    log "DNS SWITCH CREATED SUCCESSFULLY!" "SUCCESS"
     echo "════════════════════════════════════════════════"
     echo
-    echo "Your Load Balancer CNAME:"
+    echo "Your DNS Switch CNAME:"
     echo -e "  ${GREEN}$cname${NC}"
     echo
     echo "Configuration:"
@@ -624,32 +633,31 @@ setup_load_balancer() {
     echo "  Backup:  $backup_host → $backup_ip"
     echo "  CNAME:   $cname → $primary_host"
     echo
-    echo "Important Notes:"
-    echo "  • Automatic health checks are DISABLED"
-    echo "  • Failover must be performed MANUALLY"
-    echo "  • DNS TTL: ${DNS_TTL} seconds (fast propagation)"
-    echo "  • Monitor your servers externally if needed"
+    echo "Important Information:"
+    echo "  • DNS TTL: ${DNS_TTL} seconds (standard)"
+    echo "  • Automatic health checks: ${RED}DISABLED${NC}"
+    echo "  • Auto-failover: ${RED}DISABLED${NC}"
+    echo "  • Switch mode: ${YELLOW}MANUAL ONLY${NC}"
     echo
-    echo "Manual Control Options:"
-    echo "  1. Use 'Manual Control' in this script"
-    echo "  2. Switch between Primary/Backup IPs"
-    echo "  3. No background monitoring service"
+    echo "To switch between IPs:"
+    echo "  1. Use 'Manual Switch' option in this script"
+    echo "  2. Wait for DNS propagation (up to ${DNS_TTL}s)"
     echo
 }
 
 # =============================================
-# MANUAL CONTROL (NO AUTO HEALTH CHECKS)
+# MANUAL SWITCH CONTROL
 # =============================================
 
-manual_control() {
+manual_switch() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          MANUAL LOAD BALANCER CONTROL"
+    echo "          MANUAL DNS SWITCH CONTROL"
     echo "════════════════════════════════════════════════"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No load balancer setup found" "ERROR"
+        log "No DNS switch setup found" "ERROR"
         return 1
     fi
     
@@ -660,51 +668,77 @@ manual_control() {
     active_ip=$(jq -r '.active_ip // empty' "$STATE_FILE")
     
     echo "Current Status:"
-    echo "  CNAME: $cname"
+    echo "  Switch CNAME: $cname"
     echo "  Active IP: $active_ip"
     echo "  Primary IP: $primary_ip"
     echo "  Backup IP: $backup_ip"
     echo
-    echo "NOTE: Automatic health checks are DISABLED"
-    echo "      You must monitor servers externally"
+    echo "DNS Propagation:"
+    echo "  • DNS TTL: ${DNS_TTL} seconds"
+    echo "  • Changes take up to ${DNS_TTL}s to propagate"
+    echo "  • Some clients may cache DNS longer"
     echo
     
-    echo "Manual Control Options:"
-    echo "1. Switch to Primary IP"
-    echo "2. Switch to Backup IP"
-    echo "3. Quick health check (one-time)"
-    echo "4. View detailed status"
-    echo "5. Back to main menu"
+    echo "Switch Options:"
+    echo "1. Switch to Primary IP ($primary_ip)"
+    echo "2. Switch to Backup IP ($backup_ip)"
+    echo "3. Quick server status check"
+    echo "4. Back to main menu"
     echo
     
     read -rp "Select option: " choice
     
     case $choice in
         1)
-            log "Switching to Primary IP ($primary_ip)..." "INFO"
+            if [ "$active_ip" = "$primary_ip" ]; then
+                log "Already using Primary IP ($primary_ip)" "INFO"
+                return 0
+            fi
+            
+            echo
+            echo "Switching to Primary IP: $primary_ip"
+            echo "DNS update will take up to ${DNS_TTL} seconds to propagate..."
+            echo
+            
             local primary_host
-            primary_host="primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+            primary_host="primary-$(echo "$cname" | cut -d'.' -f1 | sed 's/switch-//').${BASE_HOST}"
+            
             if update_cname_target "$cname" "$primary_host"; then
                 update_state "active_ip" "$primary_ip"
+                update_state "last_switch" "$(date '+%Y-%m-%d %H:%M:%S')"
                 log "Switched to Primary IP ($primary_ip)" "SUCCESS"
+                echo
+                echo "Important: DNS changes take time to propagate."
+                echo "Allow up to ${DNS_TTL} seconds for full propagation."
             fi
             ;;
         2)
-            log "Switching to Backup IP ($backup_ip)..." "INFO"
+            if [ "$active_ip" = "$backup_ip" ]; then
+                log "Already using Backup IP ($backup_ip)" "INFO"
+                return 0
+            fi
+            
+            echo
+            echo "Switching to Backup IP: $backup_ip"
+            echo "DNS update will take up to ${DNS_TTL} seconds to propagate..."
+            echo
+            
             local backup_host
-            backup_host="backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/lb-//').${BASE_HOST}"
+            backup_host="backup-$(echo "$cname" | cut -d'.' -f1 | sed 's/switch-//').${BASE_HOST}"
+            
             if update_cname_target "$cname" "$backup_host"; then
                 update_state "active_ip" "$backup_ip"
+                update_state "last_switch" "$(date '+%Y-%m-%d %H:%M:%S')"
                 log "Switched to Backup IP ($backup_ip)" "SUCCESS"
+                echo
+                echo "Important: DNS changes take time to propagate."
+                echo "Allow up to ${DNS_TTL} seconds for full propagation."
             fi
             ;;
         3)
-            quick_health_check
+            quick_status_check
             ;;
         4)
-            show_detailed_status
-            ;;
-        5)
             return
             ;;
         *)
@@ -713,135 +747,140 @@ manual_control() {
     esac
 }
 
-quick_health_check() {
+quick_status_check() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          QUICK HEALTH CHECK (One-time)"
+    echo "          QUICK SERVER STATUS CHECK"
     echo "════════════════════════════════════════════════"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No load balancer setup found" "ERROR"
+        log "No DNS switch setup found" "ERROR"
         return 1
     fi
     
-    local primary_ip backup_ip
+    local primary_ip backup_ip active_ip cname
     primary_ip=$(jq -r '.primary_ip // empty' "$STATE_FILE")
     backup_ip=$(jq -r '.backup_ip // empty' "$STATE_FILE")
+    active_ip=$(jq -r '.active_ip // empty' "$STATE_FILE")
+    cname=$(jq -r '.cname // empty' "$STATE_FILE")
     
-    echo "This is a one-time manual check."
-    echo "Results are NOT used for automatic failover."
+    echo "This is a one-time manual status check."
+    echo "Results do NOT trigger any automatic actions."
+    echo
+    
+    echo "Current Configuration:"
+    echo "  Active IP: $active_ip"
+    echo "  Switch CNAME: $cname"
+    echo "  DNS TTL: ${DNS_TTL} seconds"
     echo
     
     # Check Primary IP
-    echo -n "Primary IP ($primary_ip): "
-    if ping -c 1 -W 2 "$primary_ip" &>/dev/null; then
-        echo -e "${GREEN}✓ REACHABLE${NC}"
-        
-        # Try HTTP/HTTPS
-        if curl -s -f --max-time 5 "http://$primary_ip" &>/dev/null; then
-            echo "  HTTP: ${GREEN}✓ OK${NC}"
-        else
-            echo "  HTTP: ${YELLOW}✗ Failed${NC}"
-        fi
-        
-        if curl -s -f -k --max-time 5 "https://$primary_ip" &>/dev/null; then
-            echo "  HTTPS: ${GREEN}✓ OK${NC}"
-        else
-            echo "  HTTPS: ${YELLOW}✗ Failed${NC}"
-        fi
+    echo "Primary Server ($primary_ip):"
+    echo -n "  Ping test: "
+    if timeout 3 ping -c 1 -W 1 "$primary_ip" &>/dev/null; then
+        echo -e "${GREEN}✓ Reachable${NC}"
     else
-        echo -e "${RED}✗ UNREACHABLE${NC}"
+        echo -e "${RED}✗ Unreachable${NC}"
     fi
     
+    echo -n "  Port 80: "
+    if timeout 3 bash -c "echo > /dev/tcp/$primary_ip/80" &>/dev/null; then
+        echo -e "${GREEN}✓ Open${NC}"
+    else
+        echo -e "${RED}✗ Closed${NC}"
+    fi
+    
+    echo -n "  Port 443: "
+    if timeout 3 bash -c "echo > /dev/tcp/$primary_ip/443" &>/dev/null; then
+        echo -e "${GREEN}✓ Open${NC}"
+    else
+        echo -e "${RED}✗ Closed${NC}"
+    fi
     echo
     
     # Check Backup IP
-    echo -n "Backup IP ($backup_ip): "
-    if ping -c 1 -W 2 "$backup_ip" &>/dev/null; then
-        echo -e "${GREEN}✓ REACHABLE${NC}"
-        
-        # Try HTTP/HTTPS
-        if curl -s -f --max-time 5 "http://$backup_ip" &>/dev/null; then
-            echo "  HTTP: ${GREEN}✓ OK${NC}"
-        else
-            echo "  HTTP: ${YELLOW}✗ Failed${NC}"
-        fi
-        
-        if curl -s -f -k --max-time 5 "https://$backup_ip" &>/dev/null; then
-            echo "  HTTPS: ${GREEN}✓ OK${NC}"
-        else
-            echo "  HTTPS: ${YELLOW}✗ Failed${NC}"
-        fi
+    echo "Backup Server ($backup_ip):"
+    echo -n "  Ping test: "
+    if timeout 3 ping -c 1 -W 1 "$backup_ip" &>/dev/null; then
+        echo -e "${GREEN}✓ Reachable${NC}"
     else
-        echo -e "${RED}✗ UNREACHABLE${NC}"
+        echo -e "${RED}✗ Unreachable${NC}"
     fi
     
+    echo -n "  Port 80: "
+    if timeout 3 bash -c "echo > /dev/tcp/$backup_ip/80" &>/dev/null; then
+        echo -e "${GREEN}✓ Open${NC}"
+    else
+        echo -e "${RED}✗ Closed${NC}"
+    fi
+    
+    echo -n "  Port 443: "
+    if timeout 3 bash -c "echo > /dev/tcp/$backup_ip/443" &>/dev/null; then
+        echo -e "${GREEN}✓ Open${NC}"
+    else
+        echo -e "${RED}✗ Closed${NC}"
+    fi
     echo
-    echo "Note: This check does not trigger any automatic actions."
-    echo "      Use manual control to switch IPs if needed."
+    
+    echo "Note: This check is for information only."
+    echo "      Use 'Manual Switch' to change active IP if needed."
+    echo "      DNS changes take ${DNS_TTL}s to propagate."
 }
 
 # =============================================
-# SIMPLIFIED STATUS FUNCTIONS
+# STATUS FUNCTIONS
 # =============================================
 
-show_detailed_status() {
+show_status() {
     echo
     echo "════════════════════════════════════════════════"
-    echo "          LOAD BALANCER DETAILED STATUS"
+    echo "          DNS SWITCH STATUS"
     echo "════════════════════════════════════════════════"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No load balancer setup found" "ERROR"
+        log "No DNS switch setup found" "ERROR"
         return 1
     fi
     
-    local cname primary_ip backup_ip active_ip created_at
-    local total_failovers last_failover
+    local cname primary_ip backup_ip active_ip created_at last_switch
     
     cname=$(jq -r '.cname // empty' "$STATE_FILE")
     primary_ip=$(jq -r '.primary_ip // empty' "$STATE_FILE")
     backup_ip=$(jq -r '.backup_ip // empty' "$STATE_FILE")
     active_ip=$(jq -r '.active_ip // empty' "$STATE_FILE")
     created_at=$(jq -r '.created_at // empty' "$STATE_FILE")
-    total_failovers=$(jq -r '.total_failovers // 0' "$STATE_FILE")
-    last_failover=$(jq -r '.last_failover // "Never"' "$STATE_FILE")
+    last_switch=$(jq -r '.last_switch // "Never"' "$STATE_FILE")
     
-    echo -e "${GREEN}Load Balancer Configuration:${NC}"
+    echo -e "${GREEN}DNS Switch Configuration:${NC}"
     echo "  CNAME: $cname"
     echo "  Created: $created_at"
     echo
     
-    echo -e "${CYAN}IP Status:${NC}"
-    echo -n "  Primary: $primary_ip"
+    echo -e "${CYAN}Server Status:${NC}"
     if [ "$active_ip" = "$primary_ip" ]; then
-        echo -e " ${GREEN}(ACTIVE)${NC}"
+        echo -e "  Primary: $primary_ip ${GREEN}(ACTIVE)${NC}"
+        echo "  Backup:  $backup_ip (standby)"
     else
-        echo " (inactive)"
-    fi
-    
-    echo -n "  Backup:  $backup_ip"
-    if [ "$active_ip" = "$backup_ip" ]; then
-        echo -e " ${GREEN}(ACTIVE)${NC}"
-    else
-        echo " (inactive)"
+        echo "  Primary: $primary_ip (standby)"
+        echo -e "  Backup:  $backup_ip ${GREEN}(ACTIVE)${NC}"
     fi
     echo
     
-    echo -e "${YELLOW}Important Notice:${NC}"
+    echo -e "${YELLOW}Operation Mode:${NC}"
     echo "  Automatic health checks: ${RED}DISABLED${NC}"
-    echo "  Failover mode: ${YELLOW}MANUAL ONLY${NC}"
+    echo "  Auto-failover: ${RED}DISABLED${NC}"
+    echo "  Control mode: ${YELLOW}MANUAL ONLY${NC}"
     echo "  DNS TTL: ${DNS_TTL} seconds"
-    echo "  Total manual failovers: $total_failovers"
-    echo "  Last failover: $last_failover"
+    echo "  Last manual switch: $last_switch"
     echo
     
-    echo -e "${ORANGE}Actions Required:${NC}"
-    echo "  1. Monitor your servers externally"
-    echo "  2. Use 'Manual Control' to switch IPs"
-    echo "  3. No background service is running"
+    echo -e "${BLUE}Usage Instructions:${NC}"
+    echo "  1. Monitor servers externally"
+    echo "  2. Use 'Manual Switch' to change IPs"
+    echo "  3. DNS changes take ${DNS_TTL}s to propagate"
+    echo "  4. Some clients may cache DNS longer"
     echo
     echo "════════════════════════════════════════════════"
 }
@@ -854,28 +893,27 @@ show_cname() {
         if [ -n "$cname" ]; then
             echo
             echo "════════════════════════════════════════════════"
-            echo "           YOUR LOAD BALANCER CNAME"
+            echo "           YOUR DNS SWITCH CNAME"
             echo "════════════════════════════════════════════════"
             echo
             echo -e "  ${GREEN}$cname${NC}"
             echo
-            echo "Configuration:"
-            echo "  • Primary IP: Default active server"
-            echo "  • Backup IP: Manual failover only"
-            echo "  • DNS TTL: ${DNS_TTL}s (fast propagation)"
-            echo "  • Automatic health checks: ${RED}DISABLED${NC}"
-            echo "  • Failover mode: ${YELLOW}MANUAL ONLY${NC}"
+            echo "Important Information:"
+            echo "  • Use this CNAME in your applications"
+            echo "  • DNS TTL: ${DNS_TTL} seconds"
+            echo "  • Manual switching only"
+            echo "  • No automatic health checks"
+            echo "  • No auto-failover"
             echo
-            echo "Important:"
-            echo "  You must monitor your servers externally."
-            echo "  Use the 'Manual Control' option to switch IPs."
-            echo "  No background monitoring service is running."
+            echo "To switch servers manually:"
+            echo "  Use the 'Manual Switch' option in this script"
+            echo "  Allow ${DNS_TTL} seconds for DNS propagation"
             echo
         else
-            log "No load balancer setup found" "ERROR"
+            log "No DNS switch setup found" "ERROR"
         fi
     else
-        log "No load balancer setup found" "ERROR"
+        log "No DNS switch setup found" "ERROR"
     fi
 }
 
@@ -885,11 +923,13 @@ show_cname() {
 
 cleanup() {
     echo
-    log "WARNING: This will delete the load balancer configuration!" "WARNING"
+    echo "════════════════════════════════════════════════"
+    echo "          CLEANUP DNS SWITCH"
+    echo "════════════════════════════════════════════════"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No load balancer setup found to cleanup" "ERROR"
+        log "No DNS switch setup found to cleanup" "ERROR"
         return 1
     fi
     
@@ -902,53 +942,68 @@ cleanup() {
     cname_record_id=$(jq -r '.cname_record_id // empty' "$STATE_FILE")
     
     if [ -z "$cname" ]; then
-        log "No active load balancer found" "ERROR"
+        log "No active DNS switch found" "ERROR"
         return 1
     fi
     
-    echo "Load Balancer to delete:"
+    echo "DNS Switch to delete:"
     echo "  CNAME: $cname"
     echo "  Primary IP: $primary_ip"
     echo "  Backup IP: $backup_ip"
     echo
     
-    read -rp "Are you sure? Type 'DELETE' to confirm: " confirm
+    read -rp "Are you sure? This will delete ALL DNS records. Type 'DELETE' to confirm: " confirm
     if [ "$confirm" != "DELETE" ]; then
         log "Cleanup cancelled" "INFO"
         return 0
     fi
     
-    log "Deleting load balancer DNS records..." "INFO"
+    echo
+    log "Deleting DNS switch records..." "INFO"
     
     # Delete DNS records
-    delete_dns_record "$cname_record_id"
-    delete_dns_record "$primary_record_id"
-    delete_dns_record "$backup_record_id"
+    local errors=0
+    
+    if ! delete_dns_record "$cname_record_id"; then
+        errors=$((errors + 1))
+    fi
+    
+    if ! delete_dns_record "$primary_record_id"; then
+        errors=$((errors + 1))
+    fi
+    
+    if ! delete_dns_record "$backup_record_id"; then
+        errors=$((errors + 1))
+    fi
     
     # Delete state files
     rm -f "$STATE_FILE" "$LOCK_FILE"
     
-    log "Load balancer cleanup completed!" "SUCCESS"
+    if [ $errors -eq 0 ]; then
+        log "DNS switch cleanup completed successfully!" "SUCCESS"
+    else
+        log "DNS switch cleanup completed with $errors error(s)" "WARNING"
+    fi
 }
 
 # =============================================
-# SIMPLIFIED MAIN MENU (NO MONITORING OPTIONS)
+# MAIN MENU
 # =============================================
 
 show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE LOAD BALANCER v4.1             ║"
+    echo "║      CLOUDFLARE DNS SWITCH v1.0              ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
-    echo -e "║  ${GREEN}1.${NC} Create Load Balancer                    ║"
-    echo -e "║  ${GREEN}2.${NC} Show Detailed Status                    ║"
-    echo -e "║  ${GREEN}3.${NC} Manual Control                          ║"
-    echo -e "║  ${GREEN}4.${NC} Show My CNAME                           ║"
-    echo -e "║  ${GREEN}5.${NC} Cleanup (Delete All)                    ║"
-    echo -e "║  ${GREEN}6.${NC} Configure API Settings                  ║"
-    echo -e "║  ${GREEN}7.${NC} Exit                                    ║"
+    echo -e "║  ${GREEN}1.${NC} Create DNS Switch                       ║"
+    echo -e "║  ${GREEN}2.${NC} Show Status                              ║"
+    echo -e "║  ${GREEN}3.${NC} Manual Switch                            ║"
+    echo -e "║  ${GREEN}4.${NC} Show My CNAME                            ║"
+    echo -e "║  ${GREEN}5.${NC} Cleanup (Delete All)                     ║"
+    echo -e "║  ${GREEN}6.${NC} Configure API                            ║"
+    echo -e "║  ${GREEN}7.${NC} Exit                                     ║"
     echo "║                                                ║"
     echo "╠════════════════════════════════════════════════╣"
     
@@ -960,16 +1015,15 @@ show_menu() {
         primary_ip=$(jq -r '.primary_ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
         
         if [ -n "$cname" ]; then
-            echo -e "║  ${CYAN}LB: $cname${NC}"
-            echo -n "║  ${CYAN}Active: $active_ip"
+            echo -e "║  ${CYAN}Switch: $cname${NC}"
             
             if [ "$active_ip" = "$primary_ip" ]; then
-                echo -e " ${GREEN}(PRIMARY)${NC}"
+                echo -e "║  ${CYAN}Active: $active_ip ${GREEN}(PRIMARY)${NC}"
             else
-                echo -e " ${YELLOW}(BACKUP)${NC}"
+                echo -e "║  ${CYAN}Active: $active_ip ${YELLOW}(BACKUP)${NC}"
             fi
             
-            echo -e "║  ${RED}Auto-health: DISABLED${NC}"
+            echo -e "║  ${RED}Auto-features: DISABLED${NC}"
         fi
     fi
     
@@ -995,17 +1049,14 @@ main() {
         log "No configuration found" "INFO"
     fi
     
-    # Display warning about disabled health checks
-    if [ -f "$STATE_FILE" ]; then
-        local health_enabled
-        health_enabled=$(jq -r '.health_checks_enabled // "false"' "$STATE_FILE")
-        if [ "$health_enabled" = "false" ]; then
-            echo
-            echo -e "${YELLOW}⚠  WARNING: Automatic health checks are DISABLED${NC}"
-            echo -e "${YELLOW}   Failover must be performed MANUALLY${NC}"
-            echo
-        fi
-    fi
+    # Display information about disabled features
+    echo
+    echo -e "${YELLOW}ℹ  IMPORTANT: All automatic features are DISABLED${NC}"
+    echo -e "${YELLOW}   • No health checks${NC}"
+    echo -e "${YELLOW}   • No auto-failover${NC}"
+    echo -e "${YELLOW}   • Manual control only${NC}"
+    echo -e "${YELLOW}   • Standard DNS TTL (${DNS_TTL}s)${NC}"
+    echo
     
     # Main loop
     while true; do
@@ -1016,19 +1067,19 @@ main() {
         case $choice in
             1)
                 if load_config; then
-                    setup_load_balancer
+                    setup_dns_switch
                 else
                     log "Please configure API settings first (option 6)" "ERROR"
                 fi
                 pause
                 ;;
             2)
-                show_detailed_status
+                show_status
                 pause
                 ;;
             3)
                 if load_config; then
-                    manual_control
+                    manual_switch
                 else
                     log "Please configure API settings first (option 6)" "ERROR"
                 fi
