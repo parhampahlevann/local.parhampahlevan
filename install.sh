@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # =============================================
-# CLOUDFLARE DNS MANAGER v3.0 - STABLE EDITION
+# CLOUDFLARE DUAL-IP DNS MANAGER v3.0
 # =============================================
 
 set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.cf-dns-manager"
+CONFIG_DIR="$HOME/.cf-dualip-dns"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state.json"
 LOG_FILE="$CONFIG_DIR/activity.log"
@@ -19,8 +19,11 @@ CF_API_TOKEN=""
 CF_ZONE_ID=""
 BASE_HOST=""
 
-# Stable DNS Settings - No auto-failover
-DNS_TTL=300  # 5 minutes TTL for stable DNS
+# Stable DNS Settings
+DNS_TTL=120  # 2 minutes TTL for better propagation
+
+# Load Balancing Strategy
+LB_STRATEGY="round-robin"  # Options: round-robin, weight-based
 
 # Colors
 RED='\033[0;31m'
@@ -28,6 +31,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
 
 # =============================================
@@ -56,6 +60,9 @@ log() {
         "INFO")
             echo -e "${CYAN}[$timestamp] [INFO]${NC} $msg"
             echo "[$timestamp] [INFO] $msg" >> "$LOG_FILE"
+            ;;
+        "DEBUG")
+            echo -e "${BLUE}[$timestamp] [DEBUG]${NC} $msg" >> "$LOG_FILE"
             ;;
         *)
             echo "[$timestamp] [$level] $msg"
@@ -124,22 +131,32 @@ CF_API_TOKEN="$CF_API_TOKEN"
 CF_ZONE_ID="$CF_ZONE_ID"
 BASE_HOST="$BASE_HOST"
 DNS_TTL="$DNS_TTL"
+LB_STRATEGY="$LB_STRATEGY"
 EOF
     log "Configuration saved" "SUCCESS"
 }
 
 save_state() {
     local cname="$1"
-    local ip="$2"
-    local record_id="$3"
+    local ip1="$2"
+    local ip2="$3"
+    local record_id1="$4"
+    local record_id2="$5"
     
     cat > "$STATE_FILE" << EOF
 {
   "cname": "$cname",
-  "ip": "$ip",
-  "record_id": "$record_id",
+  "ip1": "$ip1",
+  "ip2": "$ip2",
+  "record_id1": "$record_id1",
+  "record_id2": "$record_id2",
   "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
-  "type": "CNAME"
+  "strategy": "$LB_STRATEGY",
+  "active_ips": ["$ip1", "$ip2"],
+  "health_status": {
+    "$ip1": "unknown",
+    "$ip2": "unknown"
+  }
 }
 EOF
 }
@@ -156,6 +173,8 @@ api_request() {
     local url="${CF_API_BASE}${endpoint}"
     local response
     
+    log "API Request: $method $endpoint" "DEBUG"
+    
     if [ -n "$data" ]; then
         response=$(curl -s -X "$method" "$url" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -167,6 +186,7 @@ api_request() {
             -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false,"errors":[{"message":"Connection failed"}]}')
     fi
     
+    log "API Response: $(echo "$response" | jq -c .)" "DEBUG"
     echo "$response"
 }
 
@@ -273,6 +293,31 @@ configure_api() {
         fi
     done
     
+    echo
+    echo "Step 4: Load Balancing Strategy"
+    echo "-------------------------------"
+    echo "Choose how traffic is distributed:"
+    echo "1. Round Robin (equal distribution)"
+    echo "2. Weight Based (70% primary, 30% backup)"
+    echo
+    
+    while true; do
+        read -rp "Select strategy (1-2): " strategy_choice
+        case $strategy_choice in
+            1)
+                LB_STRATEGY="round-robin"
+                break
+                ;;
+            2)
+                LB_STRATEGY="weight-based"
+                break
+                ;;
+            *)
+                log "Invalid choice. Select 1 or 2." "ERROR"
+                ;;
+        esac
+    done
+    
     save_config
     echo
     log "Configuration completed successfully!" "SUCCESS"
@@ -312,6 +357,7 @@ create_dns_record() {
     local name="$1"
     local type="$2"
     local content="$3"
+    local ttl="${4:-$DNS_TTL}"
     
     local data
     data=$(cat << EOF
@@ -319,7 +365,7 @@ create_dns_record() {
   "type": "$type",
   "name": "$name",
   "content": "$content",
-  "ttl": $DNS_TTL,
+  "ttl": $ttl,
   "proxied": false
 }
 EOF
@@ -357,11 +403,12 @@ delete_dns_record() {
     fi
 }
 
-get_cname_record_id() {
-    local cname="$1"
+get_record_id_by_name() {
+    local name="$1"
+    local type="$2"
     
     local response
-    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${cname}")
+    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=${name}&type=${type}")
     
     if echo "$response" | jq -e '.success == true' &>/dev/null; then
         echo "$response" | jq -r '.result[0].id // empty'
@@ -370,13 +417,475 @@ get_cname_record_id() {
     fi
 }
 
+# =============================================
+# DUAL-IP DNS SETUP
+# =============================================
+
+setup_dual_ip_dns() {
+    echo
+    echo "════════════════════════════════════════════════"
+    echo "          DUAL IP DNS SETUP"
+    echo "════════════════════════════════════════════════"
+    echo
+    echo "This setup creates DNS records that distribute"
+    echo "traffic between two IP addresses."
+    echo
+    echo "Features:"
+    echo "  • Traffic distribution between 2 IPs"
+    echo "  • No automatic failover (no downtime)"
+    echo "  • Manual IP management"
+    echo "  • Health checking (optional)"
+    echo
+    
+    # Get two IP addresses
+    local ip1 ip2
+    
+    echo "Enter the two IP addresses for DNS distribution:"
+    echo "------------------------------------------------"
+    
+    # First IP
+    while true; do
+        read -rp "First IP Address: " ip1
+        if validate_ip "$ip1"; then
+            break
+        fi
+        log "Invalid IPv4 address format" "ERROR"
+    done
+    
+    # Second IP
+    while true; do
+        read -rp "Second IP Address: " ip2
+        if validate_ip "$ip2"; then
+            if [ "$ip1" = "$ip2" ]; then
+                log "Warning: Both IPs are the same!" "WARNING"
+                read -rp "Continue anyway? (y/n): " choice
+                if [[ "$choice" =~ ^[Yy]$ ]]; then
+                    break
+                fi
+            else
+                break
+            fi
+        else
+            log "Invalid IPv4 address format" "ERROR"
+        fi
+    done
+    
+    # Get CNAME prefix
+    echo
+    echo "Enter DNS record name:"
+    echo "----------------------"
+    echo "This will be your CNAME (e.g., app.example.com)"
+    echo
+    
+    local cname_prefix
+    read -rp "Subdomain prefix (leave empty for random): " cname_prefix
+    
+    if [ -z "$cname_prefix" ]; then
+        local random_id
+        random_id=$(date +%s%N | md5sum | cut -c1-8)
+        cname_prefix="app-${random_id}"
+    fi
+    
+    local cname="${cname_prefix}.${BASE_HOST}"
+    
+    echo
+    log "Creating Dual-IP DNS configuration..." "INFO"
+    echo
+    
+    # Create A records with different hostnames
+    local host1="${cname_prefix}-a1.${BASE_HOST}"
+    local host2="${cname_prefix}-a2.${BASE_HOST}"
+    
+    # Create first A record
+    log "Creating first A record: $host1 → $ip1" "INFO"
+    local record_id1
+    record_id1=$(create_dns_record "$host1" "A" "$ip1")
+    if [ -z "$record_id1" ]; then
+        log "Failed to create first A record" "ERROR"
+        return 1
+    fi
+    
+    # Create second A record
+    log "Creating second A record: $host2 → $ip2" "INFO"
+    local record_id2
+    record_id2=$(create_dns_record "$host2" "A" "$ip2")
+    if [ -z "$record_id2" ]; then
+        log "Failed to create second A record" "ERROR"
+        delete_dns_record "$record_id1"
+        return 1
+    fi
+    
+    # Create CNAME record
+    log "Creating CNAME: $cname" "INFO"
+    
+    # Based on strategy, create appropriate DNS configuration
+    if [ "$LB_STRATEGY" = "round-robin" ]; then
+        # For round-robin, create both A records with same name
+        log "Strategy: Round Robin (both IPs equally)" "INFO"
+        
+        # Create additional A record for second IP (same name)
+        local record_id3
+        record_id3=$(create_dns_record "$cname" "A" "$ip2")
+        
+        # Update first A record to use CNAME name
+        delete_dns_record "$record_id1"
+        record_id1=$(create_dns_record "$cname" "A" "$ip1")
+        
+        echo
+        echo "════════════════════════════════════════════════"
+        log "DUAL-IP DNS CREATED SUCCESSFULLY!" "SUCCESS"
+        echo "════════════════════════════════════════════════"
+        echo
+        echo "Your DNS configuration:"
+        echo -e "  ${GREEN}$cname${NC} (Round Robin)"
+        echo "  ↳ IP: $ip1"
+        echo "  ↳ IP: $ip2"
+        echo
+        echo "Traffic will be distributed equally between both IPs."
+        
+        # Update state with both record IDs
+        save_state "$cname" "$ip1" "$ip2" "$record_id1" "$record_id3"
+        
+    else # weight-based
+        log "Strategy: Weight Based (70% primary, 30% backup)" "INFO"
+        
+        # Create CNAME that points to primary
+        local cname_record_id
+        cname_record_id=$(create_dns_record "$cname" "CNAME" "$host1")
+        
+        if [ -z "$cname_record_id" ]; then
+            log "Failed to create CNAME record" "ERROR"
+            delete_dns_record "$record_id1"
+            delete_dns_record "$record_id2"
+            return 1
+        fi
+        
+        echo
+        echo "════════════════════════════════════════════════"
+        log "DUAL-IP DNS CREATED SUCCESSFULLY!" "SUCCESS"
+        echo "════════════════════════════════════════════════"
+        echo
+        echo "Your DNS configuration:"
+        echo -e "  ${GREEN}$cname${NC} (Weight Based)"
+        echo "  ↳ Primary: $host1 → $ip1 (70% traffic)"
+        echo "  ↳ Backup:  $host2 → $ip2 (30% traffic)"
+        echo
+        echo "Note: Manual switching required for failover."
+        
+        # Save state
+        save_state "$cname" "$ip1" "$ip2" "$record_id1" "$record_id2"
+    fi
+    
+    echo
+    echo "DNS Settings:"
+    echo "  TTL: $DNS_TTL seconds"
+    echo "  Propagation: Usually within 2-5 minutes"
+    echo
+    echo "You can now use ${GREEN}$cname${NC} in your applications."
+    echo
+}
+
+# =============================================
+# HEALTH CHECKING (OPTIONAL, MANUAL)
+# =============================================
+
+check_ip_health() {
+    local ip="$1"
+    
+    log "Checking health of IP: $ip" "DEBUG"
+    
+    # Try multiple methods for reliability
+    local healthy=false
+    
+    # Method 1: ping
+    if command -v ping &>/dev/null; then
+        if timeout 2 ping -c 1 -W 1 "$ip" &>/dev/null; then
+            healthy=true
+            log "Ping successful for $ip" "DEBUG"
+        fi
+    fi
+    
+    # Method 2: curl on port 80
+    if [ "$healthy" = false ] && command -v curl &>/dev/null; then
+        if timeout 2 curl -s -f "http://$ip" &>/dev/null; then
+            healthy=true
+            log "HTTP check successful for $ip" "DEBUG"
+        fi
+    fi
+    
+    # Method 3: nc on port 80
+    if [ "$healthy" = false ] && command -v nc &>/dev/null; then
+        if timeout 2 nc -z -w 1 "$ip" 80 &>/dev/null; then
+            healthy=true
+            log "Port 80 check successful for $ip" "DEBUG"
+        fi
+    fi
+    
+    if [ "$healthy" = true ]; then
+        echo "healthy"
+    else
+        echo "unhealthy"
+    fi
+}
+
+check_health_status() {
+    echo
+    echo "════════════════════════════════════════════════"
+    echo "           MANUAL HEALTH CHECK"
+    echo "════════════════════════════════════════════════"
+    echo
+    echo "This checks the health of both IPs without"
+    echo "making any DNS changes."
+    echo
+    
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No dual-IP setup found" "ERROR"
+        return 1
+    fi
+    
+    local ip1 ip2 cname
+    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
+    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
+    cname=$(jq -r '.cname // empty' "$STATE_FILE")
+    
+    if [ -z "$ip1" ] || [ -z "$ip2" ]; then
+        log "IP addresses not found in state" "ERROR"
+        return 1
+    fi
+    
+    echo "Checking IP health status..."
+    echo
+    
+    echo -n "Primary IP ($ip1): "
+    local health1
+    health1=$(check_ip_health "$ip1")
+    if [ "$health1" = "healthy" ]; then
+        echo -e "${GREEN}✓ HEALTHY${NC}"
+    else
+        echo -e "${RED}✗ UNHEALTHY${NC}"
+    fi
+    
+    echo -n "Backup IP ($ip2): "
+    local health2
+    health2=$(check_ip_health "$ip2")
+    if [ "$health2" = "healthy" ]; then
+        echo -e "${GREEN}✓ HEALTHY${NC}"
+    else
+        echo -e "${RED}✗ UNHEALTHY${NC}"
+    fi
+    
+    echo
+    echo "CNAME: $cname"
+    echo
+    echo "Note: This is a manual check only."
+    echo "No DNS records were modified."
+}
+
+# =============================================
+# MANUAL IP MANAGEMENT
+# =============================================
+
+manual_ip_management() {
+    echo
+    echo "════════════════════════════════════════════════"
+    echo "          MANUAL IP MANAGEMENT"
+    echo "════════════════════════════════════════════════"
+    echo
+    
+    if [ ! -f "$STATE_FILE" ]; then
+        log "No dual-IP setup found" "ERROR"
+        return 1
+    fi
+    
+    local cname ip1 ip2 record_id1 record_id2 strategy
+    cname=$(jq -r '.cname // empty' "$STATE_FILE")
+    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
+    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
+    record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
+    record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
+    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
+    
+    echo "Current Configuration:"
+    echo "  CNAME: $cname"
+    echo "  IP1: $ip1"
+    echo "  IP2: $ip2"
+    echo "  Strategy: $strategy"
+    echo
+    
+    echo "Options:"
+    echo "1. Switch to use only IP1"
+    echo "2. Switch to use only IP2"
+    echo "3. Use both IPs (round-robin)"
+    echo "4. Update IP addresses"
+    echo "5. Back to main menu"
+    echo
+    
+    read -rp "Select option: " choice
+    
+    case $choice in
+        1)
+            log "Switching to use only IP1 ($ip1)..." "INFO"
+            if [ "$strategy" = "round-robin" ]; then
+                # Delete second A record
+                delete_dns_record "$record_id2"
+                log "Now using only IP1 ($ip1)" "SUCCESS"
+            else
+                # Update CNAME to point to host1
+                update_cname_target "$cname" "${cname%-*}-a1.${BASE_HOST}"
+                log "Switched to IP1 ($ip1)" "SUCCESS"
+            fi
+            ;;
+        2)
+            log "Switching to use only IP2 ($ip2)..." "INFO"
+            if [ "$strategy" = "round-robin" ]; then
+                # Delete first A record, keep second
+                delete_dns_record "$record_id1"
+                log "Now using only IP2 ($ip2)" "SUCCESS"
+            else
+                # Update CNAME to point to host2
+                update_cname_target "$cname" "${cname%-*}-a2.${BASE_HOST}"
+                log "Switched to IP2 ($ip2)" "SUCCESS"
+            fi
+            ;;
+        3)
+            log "Enabling both IPs (round-robin)..." "INFO"
+            if [ "$strategy" = "weight-based" ]; then
+                # Create A records for both IPs
+                delete_dns_record "$record_id1"
+                delete_dns_record "$record_id2"
+                
+                record_id1=$(create_dns_record "$cname" "A" "$ip1")
+                record_id2=$(create_dns_record "$cname" "A" "$ip2")
+                
+                if [ -n "$record_id1" ] && [ -n "$record_id2" ]; then
+                    # Update state
+                    local temp_file
+                    temp_file=$(mktemp)
+                    jq --arg strategy "round-robin" \
+                       --arg record_id1 "$record_id1" \
+                       --arg record_id2 "$record_id2" \
+                       '.strategy = $strategy | .record_id1 = $record_id1 | .record_id2 = $record_id2' \
+                       "$STATE_FILE" > "$temp_file"
+                    mv "$temp_file" "$STATE_FILE"
+                    
+                    log "Enabled round-robin with both IPs" "SUCCESS"
+                fi
+            else
+                log "Already using round-robin" "INFO"
+            fi
+            ;;
+        4)
+            update_ip_addresses
+            ;;
+        5)
+            return
+            ;;
+        *)
+            log "Invalid option" "ERROR"
+            ;;
+    esac
+}
+
+update_ip_addresses() {
+    echo
+    echo "Update IP Addresses:"
+    echo "--------------------"
+    
+    local new_ip1 new_ip2
+    
+    while true; do
+        read -rp "New first IP: " new_ip1
+        if validate_ip "$new_ip1"; then
+            break
+        fi
+        log "Invalid IPv4 address" "ERROR"
+    done
+    
+    while true; do
+        read -rp "New second IP: " new_ip2
+        if validate_ip "$new_ip2"; then
+            break
+        fi
+        log "Invalid IPv4 address" "ERROR"
+    done
+    
+    log "Updating IP addresses..." "INFO"
+    
+    # Get current strategy
+    local strategy
+    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
+    
+    if [ "$strategy" = "round-robin" ]; then
+        # Update both A records
+        local record_id1 record_id2
+        record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
+        record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
+        
+        # Delete old records
+        delete_dns_record "$record_id1"
+        delete_dns_record "$record_id2"
+        
+        # Create new records
+        local cname
+        cname=$(jq -r '.cname // empty' "$STATE_FILE")
+        
+        record_id1=$(create_dns_record "$cname" "A" "$new_ip1")
+        record_id2=$(create_dns_record "$cname" "A" "$new_ip2")
+        
+        if [ -n "$record_id1" ] && [ -n "$record_id2" ]; then
+            # Update state
+            local temp_file
+            temp_file=$(mktemp)
+            jq --arg ip1 "$new_ip1" \
+               --arg ip2 "$new_ip2" \
+               --arg record_id1 "$record_id1" \
+               --arg record_id2 "$record_id2" \
+               '.ip1 = $ip1 | .ip2 = $ip2 | .record_id1 = $record_id1 | .record_id2 = $record_id2' \
+               "$STATE_FILE" > "$temp_file"
+            mv "$temp_file" "$STATE_FILE"
+            
+            log "IP addresses updated successfully" "SUCCESS"
+        fi
+    else
+        # For weight-based, update the A records
+        local host1 host2 record_id1 record_id2
+        host1="${cname%-*}-a1.${BASE_HOST}"
+        host2="${cname%-*}-a2.${BASE_HOST}"
+        
+        record_id1=$(get_record_id_by_name "$host1" "A")
+        record_id2=$(get_record_id_by_name "$host2" "A")
+        
+        if [ -n "$record_id1" ]; then
+            # Delete and recreate with new IP
+            delete_dns_record "$record_id1"
+            create_dns_record "$host1" "A" "$new_ip1"
+        fi
+        
+        if [ -n "$record_id2" ]; then
+            delete_dns_record "$record_id2")
+            create_dns_record "$host2" "A" "$new_ip2"
+        fi
+        
+        # Update state
+        local temp_file
+        temp_file=$(mktemp)
+        jq --arg ip1 "$new_ip1" \
+           --arg ip2 "$new_ip2" \
+           '.ip1 = $ip1 | .ip2 = $ip2' \
+           "$STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$STATE_FILE"
+        
+        log "IP addresses updated successfully" "SUCCESS"
+    fi
+}
+
 update_cname_target() {
     local cname="$1"
     local target="$2"
     
-    # Get existing CNAME record ID
+    # Get CNAME record ID
     local record_id
-    record_id=$(get_cname_record_id "$cname")
+    record_id=$(get_record_id_by_name "$cname" "CNAME")
     
     if [ -z "$record_id" ]; then
         log "CNAME record not found: $cname" "ERROR"
@@ -409,288 +918,6 @@ EOF
 }
 
 # =============================================
-# SIMPLE CNAME SETUP (NO AUTO-FAILOVER)
-# =============================================
-
-setup_simple_cname() {
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "          SIMPLE CNAME SETUP"
-    echo "════════════════════════════════════════════════"
-    echo
-    
-    echo "Choose setup type:"
-    echo "1. CNAME to existing hostname (recommended)"
-    echo "2. CNAME to IP address (A record)"
-    echo
-    
-    read -rp "Select option: " setup_type
-    
-    case $setup_type in
-        1)
-            setup_cname_to_hostname
-            ;;
-        2)
-            setup_cname_to_ip
-            ;;
-        *)
-            log "Invalid option" "ERROR"
-            return 1
-            ;;
-    esac
-}
-
-setup_cname_to_hostname() {
-    local cname_target
-    
-    echo
-    echo "Enter target hostname (where CNAME should point to):"
-    echo "Example: server1.example.com or app.server.com"
-    echo
-    
-    while true; do
-        read -rp "Target hostname: " cname_target
-        if [ -z "$cname_target" ]; then
-            log "Target hostname cannot be empty" "ERROR"
-        else
-            break
-        fi
-    done
-    
-    echo
-    echo "Enter CNAME prefix (optional):"
-    echo "Leave empty for random prefix"
-    echo
-    
-    local cname_prefix
-    read -rp "CNAME prefix: " cname_prefix
-    
-    if [ -z "$cname_prefix" ]; then
-        local random_id
-        random_id=$(date +%s%N | md5sum | cut -c1-8)
-        cname_prefix="app-${random_id}"
-    fi
-    
-    local cname="${cname_prefix}.${BASE_HOST}"
-    
-    echo
-    log "Creating CNAME: $cname → $cname_target" "INFO"
-    
-    local record_id
-    record_id=$(create_dns_record "$cname" "CNAME" "$cname_target")
-    
-    if [ -n "$record_id" ]; then
-        save_state "$cname" "$cname_target" "$record_id"
-        
-        echo
-        echo "════════════════════════════════════════════════"
-        log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
-        echo "════════════════════════════════════════════════"
-        echo
-        echo "Your CNAME is:"
-        echo -e "  ${GREEN}$cname${NC}"
-        echo
-        echo "DNS Configuration:"
-        echo "  CNAME: $cname → $cname_target"
-        echo "  TTL: $DNS_TTL seconds"
-        echo
-        echo "DNS propagation may take a few minutes."
-        echo
-    fi
-}
-
-setup_cname_to_ip() {
-    local ip_address
-    
-    echo
-    echo "Enter IP address for A record:"
-    
-    while true; do
-        read -rp "IP Address: " ip_address
-        if validate_ip "$ip_address"; then
-            break
-        fi
-        log "Invalid IPv4 address format" "ERROR"
-    done
-    
-    echo
-    echo "Enter CNAME prefix (optional):"
-    echo "Leave empty for random prefix"
-    echo
-    
-    local cname_prefix
-    read -rp "CNAME prefix: " cname_prefix
-    
-    if [ -z "$cname_prefix" ]; then
-        local random_id
-        random_id=$(date +%s%N | md5sum | cut -c1-8)
-        cname_prefix="app-${random_id}"
-    fi
-    
-    local cname="${cname_prefix}.${BASE_HOST}"
-    
-    echo
-    log "Creating CNAME: $cname → $ip_address" "INFO"
-    
-    local record_id
-    record_id=$(create_dns_record "$cname" "A" "$ip_address")
-    
-    if [ -n "$record_id" ]; then
-        save_state "$cname" "$ip_address" "$record_id"
-        
-        echo
-        echo "════════════════════════════════════════════════"
-        log "SETUP COMPLETED SUCCESSFULLY!" "SUCCESS"
-        echo "════════════════════════════════════════════════"
-        echo
-        echo "Your DNS record is:"
-        echo -e "  ${GREEN}$cname${NC} → $ip_address (A record)"
-        echo
-        echo "DNS Configuration:"
-        echo "  Type: A record"
-        echo "  TTL: $DNS_TTL seconds"
-        echo
-        echo "DNS propagation may take a few minutes."
-        echo
-    fi
-}
-
-# =============================================
-# MANUAL DNS MANAGEMENT
-# =============================================
-
-manual_dns_update() {
-    echo
-    echo "════════════════════════════════════════════════"
-    echo "           MANUAL DNS UPDATE"
-    echo "════════════════════════════════════════════════"
-    echo
-    
-    echo "This feature allows you to manually update DNS records."
-    echo "Useful for maintenance or planned changes."
-    echo
-    
-    echo "1. Update CNAME target"
-    echo "2. Create new DNS record"
-    echo "3. Delete DNS record"
-    echo "4. Back to main menu"
-    echo
-    
-    read -rp "Select option: " choice
-    
-    case $choice in
-        1)
-            update_cname_manual
-            ;;
-        2)
-            create_record_manual
-            ;;
-        3)
-            delete_record_manual
-            ;;
-        4)
-            return
-            ;;
-        *)
-            log "Invalid option" "ERROR"
-            ;;
-    esac
-}
-
-update_cname_manual() {
-    echo
-    read -rp "Enter CNAME to update (e.g., app.example.com): " cname
-    read -rp "Enter new target (e.g., new-server.example.com): " target
-    
-    if [ -z "$cname" ] || [ -z "$target" ]; then
-        log "CNAME and target cannot be empty" "ERROR"
-        return
-    fi
-    
-    log "Updating CNAME: $cname → $target" "INFO"
-    
-    if update_cname_target "$cname" "$target"; then
-        log "CNAME updated successfully" "SUCCESS"
-    fi
-}
-
-create_record_manual() {
-    echo
-    echo "Select record type:"
-    echo "1. A record"
-    echo "2. CNAME record"
-    echo "3. MX record"
-    echo "4. TXT record"
-    echo
-    
-    read -rp "Select type: " record_type_choice
-    
-    case $record_type_choice in
-        1) record_type="A" ;;
-        2) record_type="CNAME" ;;
-        3) record_type="MX" ;;
-        4) record_type="TXT" ;;
-        *) log "Invalid type" "ERROR"; return ;;
-    esac
-    
-    read -rp "Enter record name (e.g., subdomain.example.com): " name
-    read -rp "Enter record content: " content
-    
-    if [ -z "$name" ] || [ -z "$content" ]; then
-        log "Name and content cannot be empty" "ERROR"
-        return
-    fi
-    
-    log "Creating $record_type record: $name → $content" "INFO"
-    
-    local record_id
-    record_id=$(create_dns_record "$name" "$record_type" "$content")
-    
-    if [ -n "$record_id" ]; then
-        log "Record created successfully" "SUCCESS"
-    fi
-}
-
-delete_record_manual() {
-    echo
-    echo "WARNING: This will permanently delete a DNS record!"
-    echo
-    
-    read -rp "Enter record name to delete (e.g., subdomain.example.com): " name
-    
-    if [ -z "$name" ]; then
-        log "Record name cannot be empty" "ERROR"
-        return
-    fi
-    
-    # Get record ID
-    local response
-    response=$(api_request "GET" "/zones/${CF_ZONE_ID}/dns_records?name=${name}")
-    
-    if echo "$response" | jq -e '.success == true' &>/dev/null; then
-        local record_id
-        record_id=$(echo "$response" | jq -r '.result[0].id // empty')
-        
-        if [ -z "$record_id" ]; then
-            log "Record not found: $name" "ERROR"
-            return
-        fi
-        
-        read -rp "Are you sure you want to delete $name? (type 'DELETE' to confirm): " confirm
-        
-        if [ "$confirm" = "DELETE" ]; then
-            if delete_dns_record "$record_id"; then
-                log "Record deleted successfully" "SUCCESS"
-            fi
-        else
-            log "Deletion cancelled" "INFO"
-        fi
-    else
-        log "Failed to find record" "ERROR"
-    fi
-}
-
-# =============================================
 # STATUS AND INFO FUNCTIONS
 # =============================================
 
@@ -702,40 +929,56 @@ show_status() {
     echo
     
     if [ -f "$STATE_FILE" ]; then
-        local cname ip record_id created_at
-        cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        ip=$(jq -r '.ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        record_id=$(jq -r '.record_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        created_at=$(jq -r '.created_at // empty' "$STATE_FILE" 2>/dev/null || echo "")
-        type=$(jq -r '.type // "CNAME"' "$STATE_FILE" 2>/dev/null || echo "CNAME")
+        local cname ip1 ip2 strategy created_at
+        cname=$(jq -r '.cname // empty' "$STATE_FILE")
+        ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
+        ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
+        strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
+        created_at=$(jq -r '.created_at // empty' "$STATE_FILE")
         
         if [ -n "$cname" ]; then
-            echo -e "${GREEN}Active DNS Record:${NC}"
-            echo "  Name: $cname"
-            echo "  Type: $type"
-            echo "  Target: $ip"
+            echo -e "${GREEN}Dual-IP DNS Configuration:${NC}"
+            echo "  CNAME: $cname"
+            echo "  IP1: $ip1"
+            echo "  IP2: $ip2"
+            echo "  Strategy: $strategy"
             echo "  Created: $created_at"
-            echo "  Record ID: $record_id"
             echo
+            
+            # Show current DNS records
+            echo -e "${CYAN}Current DNS Records:${NC}"
+            
+            if [ "$strategy" = "round-robin" ]; then
+                echo "  $cname → $ip1 (A)"
+                echo "  $cname → $ip2 (A)"
+                echo "  Traffic: Distributed equally"
+            else
+                local host1 host2
+                host1="${cname%-*}-a1.${BASE_HOST}"
+                host2="${cname%-*}-a2.${BASE_HOST}"
+                echo "  $cname → $host1 (CNAME)"
+                echo "  $host1 → $ip1 (A)"
+                echo "  $host2 → $ip2 (A)"
+                echo "  Traffic: 70% primary, 30% backup"
+            fi
         fi
     else
-        echo -e "${YELLOW}No active DNS record found${NC}"
+        echo -e "${YELLOW}No dual-IP DNS configuration found${NC}"
         echo
     fi
     
-    # Test API connectivity
-    echo -e "${CYAN}API Status:${NC}"
-    if test_api; then
+    # API status
+    echo
+    echo -e "${PURPLE}API Status:${NC}"
+    if load_config && test_api; then
         echo -e "  Connection: ${GREEN}✓ OK${NC}"
+        if test_zone; then
+            echo -e "  Zone Access: ${GREEN}✓ OK${NC}"
+        else
+            echo -e "  Zone Access: ${RED}✗ FAILED${NC}"
+        fi
     else
-        echo -e "  Connection: ${RED}✗ FAILED${NC}"
-    fi
-    
-    # Test Zone access
-    if test_zone; then
-        echo -e "  Zone Access: ${GREEN}✓ OK${NC}"
-    else
-        echo -e "  Zone Access: ${RED}✗ FAILED${NC}"
+        echo -e "  Connection: ${RED}✗ NOT CONFIGURED${NC}"
     fi
     
     echo
@@ -745,24 +988,30 @@ show_status() {
 show_cname() {
     if [ -f "$STATE_FILE" ]; then
         local cname
-        cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        cname=$(jq -r '.cname // empty' "$STATE_FILE")
         
         if [ -n "$cname" ]; then
             echo
             echo "════════════════════════════════════════════════"
-            echo "           YOUR DNS RECORD"
+            echo "           YOUR DUAL-IP DNS RECORD"
             echo "════════════════════════════════════════════════"
             echo
             echo -e "  ${GREEN}$cname${NC}"
             echo
-            echo "Use this record in your applications."
-            echo "DNS propagation may take a few minutes."
+            echo "This CNAME distributes traffic between two IPs."
+            echo
+            echo "Usage:"
+            echo "  • Use $cname in your applications"
+            echo "  • DNS will distribute traffic automatically"
+            echo "  • No automatic failover (stable operation)"
+            echo
+            echo "DNS propagation: Usually 2-5 minutes"
             echo
         else
-            log "No DNS record found. Please run setup first." "ERROR"
+            log "No dual-IP DNS record found" "ERROR"
         fi
     else
-        log "No DNS record found. Please run setup first." "ERROR"
+        log "No dual-IP DNS record found" "ERROR"
     fi
 }
 
@@ -772,26 +1021,32 @@ show_cname() {
 
 cleanup() {
     echo
-    log "WARNING: This will delete the active DNS record!" "WARNING"
+    log "WARNING: This will delete ALL dual-IP DNS records!" "WARNING"
     echo
     
     if [ ! -f "$STATE_FILE" ]; then
-        log "No active record found to cleanup" "ERROR"
+        log "No dual-IP setup found to cleanup" "ERROR"
         return 1
     fi
     
-    local cname record_id
-    cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
-    record_id=$(jq -r '.record_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
+    local cname ip1 ip2 record_id1 record_id2 strategy
+    cname=$(jq -r '.cname // empty' "$STATE_FILE")
+    ip1=$(jq -r '.ip1 // empty' "$STATE_FILE")
+    ip2=$(jq -r '.ip2 // empty' "$STATE_FILE")
+    record_id1=$(jq -r '.record_id1 // empty' "$STATE_FILE")
+    record_id2=$(jq -r '.record_id2 // empty' "$STATE_FILE")
+    strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE")
     
     if [ -z "$cname" ]; then
-        log "No active record found" "ERROR"
+        log "No active dual-IP setup found" "ERROR"
         return 1
     fi
     
-    echo "Record to delete:"
+    echo "Records to delete:"
     echo "  CNAME: $cname"
-    echo "  Record ID: $record_id"
+    echo "  IP1: $ip1"
+    echo "  IP2: $ip2"
+    echo "  Strategy: $strategy"
     echo
     
     read -rp "Are you sure? Type 'DELETE' to confirm: " confirm
@@ -800,10 +1055,22 @@ cleanup() {
         return 0
     fi
     
-    log "Deleting DNS record..." "INFO"
+    log "Deleting DNS records..." "INFO"
     
-    if [ -n "$record_id" ]; then
-        delete_dns_record "$record_id"
+    # Delete records based on strategy
+    if [ "$strategy" = "round-robin" ]; then
+        # Delete both A records
+        delete_dns_record "$record_id1"
+        delete_dns_record "$record_id2"
+    else
+        # Delete CNAME and A records
+        local cname_record_id
+        cname_record_id=$(get_record_id_by_name "$cname" "CNAME")
+        delete_dns_record "$cname_record_id"
+        
+        # Delete A records
+        delete_dns_record "$record_id1"
+        delete_dns_record "$record_id2"
     fi
     
     # Delete state file
@@ -820,27 +1087,32 @@ show_menu() {
     clear
     echo
     echo "╔════════════════════════════════════════════════╗"
-    echo "║    CLOUDFLARE DNS MANAGER v3.0 - STABLE      ║"
+    echo "║    CLOUDFLARE DUAL-IP DNS MANAGER v3.0       ║"
     echo "╠════════════════════════════════════════════════╣"
     echo "║                                                ║"
-    echo -e "║  ${GREEN}1.${NC} Create Simple DNS Record                 ║"
-    echo -e "║  ${GREEN}2.${NC} Show Current Status                      ║"
-    echo -e "║  ${GREEN}3.${NC} Manual DNS Update                        ║"
-    echo -e "║  ${GREEN}4.${NC} Show My DNS Record                       ║"
-    echo -e "║  ${GREEN}5.${NC} Cleanup (Delete Record)                  ║"
-    echo -e "║  ${GREEN}6.${NC} Configure API Settings                   ║"
-    echo -e "║  ${GREEN}7.${NC} Exit                                     ║"
+    echo -e "║  ${GREEN}1.${NC} Create Dual-IP DNS Record               ║"
+    echo -e "║  ${GREEN}2.${NC} Show Current Status                     ║"
+    echo -e "║  ${GREEN}3.${NC} Manual IP Management                    ║"
+    echo -e "║  ${GREEN}4.${NC} Check IP Health (Manual)                ║"
+    echo -e "║  ${GREEN}5.${NC} Show My CNAME                           ║"
+    echo -e "║  ${GREEN}6.${NC} Cleanup (Delete All)                    ║"
+    echo -e "║  ${GREEN}7.${NC} Configure API Settings                  ║"
+    echo -e "║  ${GREEN}8.${NC} Exit                                    ║"
     echo "║                                                ║"
     echo "╠════════════════════════════════════════════════╣"
     
     # Show current status
     if [ -f "$STATE_FILE" ]; then
-        local cname
+        local cname ip1 ip2 strategy
         cname=$(jq -r '.cname // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        ip1=$(jq -r '.ip1 // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        ip2=$(jq -r '.ip2 // empty' "$STATE_FILE" 2>/dev/null || echo "")
+        strategy=$(jq -r '.strategy // "round-robin"' "$STATE_FILE" 2>/dev/null || echo "")
+        
         if [ -n "$cname" ]; then
-            local ip
-            ip=$(jq -r '.ip // empty' "$STATE_FILE" 2>/dev/null || echo "")
-            echo -e "║  ${CYAN}Active: $cname → $ip${NC}"
+            echo -e "║  ${CYAN}Active: $cname${NC}"
+            echo -e "║  ${CYAN}IPs: $ip1 / $ip2${NC}"
+            echo -e "║  ${CYAN}Strategy: $strategy${NC}"
         fi
     fi
     
@@ -870,14 +1142,14 @@ main() {
     while true; do
         show_menu
         
-        read -rp "Select option (1-7): " choice
+        read -rp "Select option (1-8): " choice
         
         case $choice in
             1)
                 if load_config; then
-                    setup_simple_cname
+                    setup_dual_ip_dns
                 else
-                    log "Please configure API settings first (option 6)" "ERROR"
+                    log "Please configure API settings first (option 7)" "ERROR"
                 fi
                 pause
                 ;;
@@ -887,31 +1159,39 @@ main() {
                 ;;
             3)
                 if load_config; then
-                    manual_dns_update
+                    manual_ip_management
                 else
-                    log "Please configure API settings first (option 6)" "ERROR"
+                    log "Please configure API settings first (option 7)" "ERROR"
                 fi
                 pause
                 ;;
             4)
-                show_cname
+                if load_config; then
+                    check_health_status
+                else
+                    log "Please configure API settings first (option 7)" "ERROR"
+                fi
                 pause
                 ;;
             5)
-                cleanup
+                show_cname
                 pause
                 ;;
             6)
-                configure_api
+                cleanup
+                pause
                 ;;
             7)
+                configure_api
+                ;;
+            8)
                 echo
                 log "Goodbye!" "INFO"
                 echo
                 exit 0
                 ;;
             *)
-                log "Invalid option. Please select 1-7." "ERROR"
+                log "Invalid option. Please select 1-8." "ERROR"
                 sleep 1
                 ;;
         esac
